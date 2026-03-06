@@ -2,7 +2,7 @@
 
 Automacao para login no Vivo Empresas e download de faturas em PDF.
 
-## Setup rapido (pyenv + venv)
+## Configuracao rapida (pyenv + venv)
 
 ```bash
 pyenv local 3.11.14
@@ -25,20 +25,24 @@ export VIVO_PASSWORD="SUA_SENHA"
 2) Rode o fluxo completo:
 
 ```bash
-python scrapling_vivo_login_test.py
+python vivo_download.py
 ```
 
-3) Download filtrado por conta + mes/ano:
+3) Apenas listar sem baixar:
 
 ```bash
-python scrapling_vivo_login_test.py --account-number 0000000000 --month 2 --year 2026
+python vivo_download.py --listar
+```
+
+4) Modo debug (salva screenshot + HTML por etapa):
+
+```bash
+python vivo_download.py --debug
 ```
 
 ## Estrutura
 
-- `scrapling_vivo_login_test.py`: login + navegacao + download das faturas
-- `download_vivo_bills.py`: fluxo alternativo com Playwright direto
-- `screenshot_vivo_first_screen.py`: captura da tela inicial
+- `vivo_download.py`: login + navegacao + listagem + download via XPath
 
 ## Qualidade
 
