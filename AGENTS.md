@@ -111,6 +111,7 @@ python vivo_download.py --debug
 - Capture excecoes especificas quando possivel.
 - Se `except Exception` amplo for necessario, mantenha bloco pequeno e registre contexto (`[warn]`).
 - Nunca ignore silenciosamente falhas que possam invalidar o resultado final.
+- Aprendizado pratico: executar `page.content()` e `page.screenshot()` durante etapas criticas ajuda a estabilizar o crawler mesmo quando o resultado nao e salvo em disco.
 ### 5.7 Estilo de logs/saida
 - Mantenha os prefixos de print existentes:
   - `[info]` progress
@@ -122,6 +123,7 @@ python vivo_download.py --debug
 - Mantenha screenshots/metadados em `screenshots/...`.
 - Sempre crie diretorios de saida com `mkdir(parents=True, exist_ok=True)`.
 - Grave JSON em formato amigavel para maquina (`ensure_ascii=True`, `indent=2`).
+- No `vivo_download.py`, sem `--debug` nao salvar snapshots/HTML; com `--debug` salvar ambos para diagnostico.
 ## 6) Escopo de Ruff e mypy
 - Regras do Ruff: `E`, `F`, `I`, `B`, `UP`.
 - Exclusoes de lint/tipo incluem `.venv`, `downloads` e `screenshots`.
