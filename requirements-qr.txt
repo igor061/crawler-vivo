@@ -1,0 +1,4 @@
+# Dependencias opcionais para extracao de PIX via QR Code em PDFs
+numpy==2.4.2
+opencv-python-headless==4.13.0.92
+pymupdf==1.27.1
