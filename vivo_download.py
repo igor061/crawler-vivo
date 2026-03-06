@@ -289,7 +289,7 @@ def main() -> None:
     if args.debug:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata_file = output_dir / "xpath_loop_resultado_tmp.json"
+    metadata_file = download_dir / "xpath_loop_resultado_tmp.json"
 
     runtime: dict[str, Any] = {
         "campo_senha_detectado": False,
@@ -324,7 +324,13 @@ def main() -> None:
         except Exception:
             pass
         runtime["debug_paginas"] = int(runtime["debug_paginas"]) + 1
-        log_event("info", "Snapshot debug salvo", etapa=etapa, arquivo=nome_base)
+        log_event(
+            "info",
+            "Snapshot debug coletado",
+            etapa=etapa,
+            screenshot=screenshot_path.name,
+            html=html_path.name,
+        )
 
     def page_action(page: Any):
         log_event("info", "Abertura da pagina inicial", url=args.url)
@@ -594,7 +600,7 @@ def main() -> None:
     }
 
     metadata_file = montar_nome_resultado(
-        output_dir,
+        download_dir,
         str(runtime.get("cnpj_cliente", "") or cnpj_cliente),
         coleta_dt,
     )
