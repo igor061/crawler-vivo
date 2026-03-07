@@ -14,7 +14,9 @@ camoufox fetch
 
 Configure as credenciais — escolha uma das formas:
 
-**Forma 1 — arquivo `.env`** (recomendado, persiste entre execucoes):
+**Forma 1 — prompt interativo:** execute o comando diretamente; se nenhuma credencial for encontrada, o script solicita CPF/CNPJ e senha no terminal (senha mascarada, timeout de 30s) e pergunta se deseja salvar em `.env` para as proximas execucoes.
+
+**Forma 2 — arquivo `.env`** (persiste entre execucoes):
 ```bash
 cat > .env <<'EOF'
 VIVO_CPF=SEU_CPF_OU_CNPJ
@@ -22,19 +24,17 @@ VIVO_PASSWORD=SUA_SENHA
 EOF
 ```
 
-**Forma 2 — variaveis de ambiente** (sessao atual do shell):
+**Forma 3 — variaveis de ambiente** (sessao atual do shell):
 ```bash
 export VIVO_CPF=SEU_CPF_OU_CNPJ
 export VIVO_PASSWORD=SUA_SENHA
 ```
 
-**Forma 3 — argumentos na linha de comando:**
+**Forma 4 — argumentos na linha de comando:**
 ```bash
 vivo-movel --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
 vivo-fixo  --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
 ```
-
-**Forma 4 — prompt interativo:** se nenhuma credencial for encontrada, o script solicita CPF/CNPJ e senha diretamente no terminal (senha mascarada, timeout de 30s) e pergunta se deseja salvar em `.env` para as proximas execucoes.
 
 Execute:
 
