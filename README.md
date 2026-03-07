@@ -9,6 +9,7 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install git+https://github.com/igor061/crawler-vivo.git
 playwright install chromium
+camoufox fetch
 ```
 
 Crie o arquivo de credenciais no diretorio onde vai rodar os comandos:
