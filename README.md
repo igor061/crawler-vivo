@@ -42,6 +42,12 @@ vivo-fixo                          # Vivo Fixo: baixa faturas
 vivo-extrator /caminho/fatura.pdf  # Extrai dados de um PDF
 ```
 
+## Atualizacao
+
+```bash
+pip install --upgrade git+https://github.com/igor061/crawler-vivo.git
+```
+
 ---
 
 ## Objetivo do projeto
