@@ -549,6 +549,36 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def validar_credenciais(cpf: str, password: str) -> bool:
+    """Valida se CPF/CNPJ e senha foram informados. Imprime instrucoes se nao."""
+    erros = []
+    if not normalize_document(cpf):
+        erros.append("CPF/CNPJ nao informado (VIVO_CPF)")
+    if not password:
+        erros.append("Senha nao informada (VIVO_PASSWORD)")
+    if not erros:
+        return True
+
+    print()
+    print("[erro] Credenciais ausentes: " + " | ".join(erros))
+    print()
+    print("  Configure de uma das formas a seguir:")
+    print()
+    print("  1) Arquivo .env no diretorio atual:")
+    print("       echo 'VIVO_CPF=seu_cpf_ou_cnpj' >> .env")
+    print("       echo 'VIVO_PASSWORD=sua_senha'  >> .env")
+    print()
+    print("  2) Variaveis de ambiente:")
+    print("       export VIVO_CPF=seu_cpf_ou_cnpj")
+    print("       export VIVO_PASSWORD=sua_senha")
+    print()
+    print("  3) Argumentos na linha de comando:")
+    print("       vivo-movel --cpf seu_cpf_ou_cnpj --password sua_senha")
+    print("       vivo-fixo  --cpf seu_cpf_ou_cnpj --password sua_senha")
+    print()
+    return False
+
+
 def build_common_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

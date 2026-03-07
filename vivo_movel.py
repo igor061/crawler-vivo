@@ -29,6 +29,7 @@ from vivo_core import (
     normalize_document,
     referencia_para_yyyymm,
     resolve_mode,
+    validar_credenciais,
 )
 
 
@@ -533,6 +534,8 @@ def build_config(args: argparse.Namespace) -> MovelConfig:
 def main() -> None:
     carregar_env_arquivo(Path(".env"))
     args = parse_args()
+    if not validar_credenciais(args.cpf, args.password):
+        raise SystemExit(1)
     VivoMovelApp(build_config(args)).run()
 
 

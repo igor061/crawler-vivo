@@ -12,8 +12,9 @@ playwright install chromium
 camoufox fetch
 ```
 
-Crie o arquivo de credenciais no diretorio onde vai rodar os comandos:
+Configure as credenciais — escolha uma das formas:
 
+**Forma 1 — arquivo `.env`** (recomendado, persiste entre execucoes):
 ```bash
 cat > .env <<'EOF'
 VIVO_CPF=SEU_CPF_OU_CNPJ
@@ -21,7 +22,21 @@ VIVO_PASSWORD=SUA_SENHA
 EOF
 ```
 
-Pronto. Execute:
+**Forma 2 — variaveis de ambiente** (sessao atual do shell):
+```bash
+export VIVO_CPF=SEU_CPF_OU_CNPJ
+export VIVO_PASSWORD=SUA_SENHA
+```
+
+**Forma 3 — argumentos na linha de comando:**
+```bash
+vivo-movel --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
+vivo-fixo  --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
+```
+
+> Se nenhuma credencial for encontrada, o script imprime instrucoes e encerra sem abrir o browser.
+
+Execute:
 
 ```bash
 vivo-movel                         # Vivo Movel: baixa faturas
@@ -56,18 +71,11 @@ pip install -r requirements-qr.txt
 
 ## Configuracao de credenciais
 
-Opcao 1 (recomendada): arquivo `.env` no diretorio de trabalho.
+Veja as 3 formas na secao de instalacao acima. Em desenvolvimento local, copie o exemplo:
 
 ```bash
 cp .env.example .env
 # edite .env com seu CPF/CNPJ e senha
-```
-
-Opcao 2: variaveis de ambiente.
-
-```bash
-export VIVO_CPF="SEU_CPF_OU_CNPJ"
-export VIVO_PASSWORD="SUA_SENHA"
 ```
 
 ## Como usar

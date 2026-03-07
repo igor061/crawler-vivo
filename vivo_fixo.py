@@ -29,6 +29,7 @@ from vivo_core import (
     normalize_document,
     referencia_para_yyyymm,
     resolve_mode,
+    validar_credenciais,
 )
 
 
@@ -591,8 +592,9 @@ def build_config(args: argparse.Namespace) -> FixoConfig:
 def main() -> None:
     carregar_env_arquivo(Path(".env"))
     args = parse_args()
-    config = build_config(args)
-    VivoFixoApp(config).run()
+    if not validar_credenciais(args.cpf, args.password):
+        raise SystemExit(1)
+    VivoFixoApp(build_config(args)).run()
 
 
 if __name__ == "__main__":
