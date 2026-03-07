@@ -96,12 +96,23 @@ def _extrair_secoes_fixo(page: Any, config: FixoConfig, logger: Logger) -> list[
                 if el.count() > 0:
                     referencia = el.inner_text(timeout=1500).strip()
                     cls = el.get_attribute("class") or ""
-                    if "PAID" in cls.upper():
+                    cls_up = cls.upper()
+                    if "PAID" in cls_up or "CLOSED" in cls_up:
                         situacao = "Paga"
-                    elif "OPEN" in cls.upper() or "DUE" in cls.upper():
+                    elif "OPEN" in cls_up or "DUE" in cls_up or "PENDING" in cls_up:
                         situacao = "Aberta"
+                    elif "OVERDUE" in cls_up or "LATE" in cls_up or "EXPIRED" in cls_up:
+                        situacao = "Vencida"
             except Exception:
                 pass
+            # fallback: tenta badge de status na linha
+            if not situacao:
+                try:
+                    badge = row.locator(".badge, [data-test-invoice-status]").first
+                    if badge.count() > 0:
+                        situacao = badge.inner_text(timeout=1000).strip()
+                except Exception:
+                    pass
             faturas.append({"valor": valor, "referencia": referencia, "situacao": situacao})
 
         secoes.append({
@@ -198,29 +209,52 @@ class FixoDownloadService:
                 continue
 
             referencia = ""
+            situacao = ""
             try:
-                referencia = dd.evaluate("""el => {
+                result = dd.evaluate("""el => {
                     const dateRe = /^[A-Za-z\u00C0-\u017F]{3}\/\d{4}$/;
+                    let referencia = '';
+                    let situacao = '';
                     let node = el;
-                    for (let depth = 0; depth < 8; depth++) {
+                    for (let depth = 0; depth < 12; depth++) {
                         node = node.parentElement;
                         if (!node || node.tagName === 'BODY') break;
-                        for (const child of node.children) {
-                            if (child.contains(el)) continue;
-                            const t = (child.textContent || '').trim();
-                            if (dateRe.test(t)) return t;
-                            for (const gc of child.children) {
-                                const gt = (gc.textContent || '').trim();
-                                if (dateRe.test(gt)) return gt;
+                        // Detecta situacao pelo container de secao
+                        const cls = node.className || '';
+                        if (!situacao) {
+                            if (cls.includes('paid-grid-row') || cls.includes('invoice-paid'))
+                                situacao = 'Paga';
+                            else if (cls.includes('open-grid-row') || cls.includes('invoice-open'))
+                                situacao = 'Aberta';
+                            else if (cls.includes('overdue-grid-row') || cls.includes('invoice-overdue'))
+                                situacao = 'Vencida';
+                        }
+                        // Detecta referencia em siblings
+                        if (!referencia) {
+                            for (const child of node.children) {
+                                if (child.contains(el)) continue;
+                                const t = (child.textContent || '').trim();
+                                if (dateRe.test(t)) { referencia = t; break; }
+                                for (const gc of child.children) {
+                                    const gt = (gc.textContent || '').trim();
+                                    if (dateRe.test(gt)) { referencia = gt; break; }
+                                }
+                                if (referencia) break;
                             }
                         }
+                        if (referencia && situacao) break;
                     }
-                    return '';
-                }""") or ""
+                    return { referencia, situacao };
+                }""") or {}
+                referencia = result.get("referencia", "") if isinstance(result, dict) else ""
+                situacao = result.get("situacao", "") if isinstance(result, dict) else ""
             except Exception:
                 pass
 
-            opcoes.append({"toggle": toggle, "referencia": referencia})
+            # Normaliza capitalização: "fev/2026" → "Fev/2026"
+            if referencia and referencia[0].islower():
+                referencia = referencia[0].upper() + referencia[1:]
+            opcoes.append({"toggle": toggle, "referencia": referencia, "situacao": situacao})
 
         return opcoes
 
@@ -440,7 +474,7 @@ class FixoDownloadService:
             for idx, opcao in enumerate(opcoes_para_baixar, start=1):
                 fatura = faturas_sec[idx - 1] if idx - 1 < len(faturas_sec) else {}
                 referencia = opcao.get("referencia") or fatura.get("referencia", "")
-                situacao = fatura.get("situacao", "")
+                situacao = fatura.get("situacao", "") or opcao.get("situacao", "")
                 runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
                 resultados.append(self._baixar_com_retry(
                     page, opcao["toggle"], codigo_cliente, cnpj, idx,

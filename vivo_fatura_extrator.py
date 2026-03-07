@@ -291,13 +291,15 @@ def extrair_url_nfe(texto: str) -> str:
 
 
 def extrair_destinatario(texto: str) -> str:
-    match = re.search(
+    for pattern in [
         r"\n([A-Z][A-Z\s\-\.]{3,})\s+CPF/CNPJ\s*:\s*[0-9./-]{11,18}",
-        texto,
-    )
-    if not match:
-        return ""
-    return " ".join(match.group(1).split())
+        r"Raz[aã]o\s+Social\s*:\s*(.+)",
+        r"NOME\s*:\s*(.+)",
+    ]:
+        match = re.search(pattern, texto, re.IGNORECASE)
+        if match:
+            return " ".join(match.group(1).split())
+    return ""
 
 
 def extrair_emissor(texto: str, pix: str) -> str:

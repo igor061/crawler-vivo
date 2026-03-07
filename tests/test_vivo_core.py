@@ -16,7 +16,7 @@ from vivo_core import (
 
 
 def test_normalize_document_keeps_digits_only() -> None:
-    assert normalize_document("10.755.237/0001-36") == "10755237000136"
+    assert normalize_document("99.999.999/0001-91") == "99999999000191"
 
 
 def test_ano_mes_por_vencimento_returns_zeroes_for_invalid_date() -> None:
@@ -29,10 +29,10 @@ def test_ano_mes_por_vencimento_parses_dd_mm_yyyy() -> None:
 
 def test_extrair_cnpj_da_pagina_prefers_dashboard_document_number() -> None:
     html = """
-    <script>window.dashboardDocumentNumber = '10755237000136';</script>
+    <script>window.dashboardDocumentNumber = '99999999000191';</script>
     <div>00000000000000</div>
     """
-    assert extrair_cnpj_da_pagina(html) == "10755237000136"
+    assert extrair_cnpj_da_pagina(html) == "99999999000191"
 
 
 def test_format_coleta_data_hora_uses_seconds_precision() -> None:
@@ -41,17 +41,17 @@ def test_format_coleta_data_hora_uses_seconds_precision() -> None:
 
 
 def test_naming_service_appends_counter_when_file_exists(tmp_path: Path) -> None:
-    target_1 = tmp_path / "vivo-movel-10755237000136-0466032796-2026-02.pdf"
+    target_1 = tmp_path / "vivo-movel-99999999000191-0000000000-2026-02.pdf"
     target_1.write_bytes(b"x")
 
     target_2 = NamingService.montar_nome_arquivo_padrao(
-        cnpj_cliente="10.755.237/0001-36",
-        conta="0466032796",
+        cnpj_cliente="99.999.999/0001-91",
+        conta="0000000000",
         vencimento="15/02/2026",
         download_dir=tmp_path,
     )
 
-    assert target_2.name == "vivo-movel-10755237000136-0466032796-2026-02-2.pdf"
+    assert target_2.name == "vivo-movel-99999999000191-0000000000-2026-02-2.pdf"
 
 
 def test_referencia_para_yyyymm_fev_2026() -> None:
@@ -89,7 +89,7 @@ def test_enriquecer_com_extrator_enriches_item(monkeypatch: pytest.MonkeyPatch, 
             "pix_copia_cola": "000201...",
             "emissor": "TELEFONICA BRASIL",
             "destinatario": "CLIENTE TESTE",
-            "identificador_fatura": "0466032796",
+            "identificador_fatura": "0000000000",
             "telefone": "(11) 9999-8888",
             "numeros_vivo": ["11999998888"],
             "url_nfe": "https://dfe-portal.svrs.rs.gov.br/NFe/QRCode?chNFCom=12345",
@@ -110,7 +110,7 @@ def test_enriquecer_com_extrator_enriches_item(monkeypatch: pytest.MonkeyPatch, 
     assert result["codigo_de_barras_sem_espaco"] == "846700000017435001082021601102511002000420938712"
     assert result["pix_copia_cola"] == "000201..."
     assert result["emissor"] == "TELEFONICA BRASIL"
-    assert result["identificador_fatura"] == "0466032796"
+    assert result["identificador_fatura"] == "0000000000"
     assert result["valor"] == "R$ 199,90"
     assert result["url_nfe"].startswith("https://")
 
