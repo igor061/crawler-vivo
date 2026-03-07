@@ -614,12 +614,12 @@ def validar_credenciais(cpf: str, password: str, timeout: int = 30) -> "tuple[st
         return cpf, password
 
     print()
-    print(f"[info] Credencial(is) ausente(s): {', '.join(faltando)}")
-    print(f"[info] Voce tem {timeout}s para preencher cada campo. Ctrl+C para cancelar.")
+    print("  Credenciais do Vivo Empresas nao configuradas.")
+    print(f"  Informe abaixo (timeout {timeout}s por campo, Ctrl+C cancela):")
     print()
 
     if not normalize_document(cpf):
-        val = _ler_com_timeout("  CPF ou CNPJ (somente numeros): ", timeout=timeout)
+        val = _ler_com_timeout("  CPF ou CNPJ do Vivo Empresas (somente numeros): ", timeout=timeout)
         if not val or not normalize_document(val):
             print("\n[erro] Timeout ou valor invalido.")
             _imprimir_ajuda_credenciais()
@@ -627,7 +627,7 @@ def validar_credenciais(cpf: str, password: str, timeout: int = 30) -> "tuple[st
         cpf = val.strip()
 
     if not password:
-        val = _ler_com_timeout("  Senha: ", timeout=timeout, senha=True)
+        val = _ler_com_timeout("  Senha do Vivo Empresas: ", timeout=timeout, senha=True)
         if not val:
             print("\n[erro] Timeout ou senha em branco.")
             _imprimir_ajuda_credenciais()
