@@ -34,6 +34,8 @@ vivo-movel --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
 vivo-fixo  --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
 ```
 
+**Forma 4 — prompt interativo:** se nenhuma credencial for encontrada, o script solicita CPF/CNPJ e senha diretamente no terminal (senha mascarada, timeout de 30s) e pergunta se deseja salvar em `.env` para as proximas execucoes.
+
 Execute:
 
 ```bash
