@@ -45,6 +45,8 @@ class FaturaExtraida:
     emissor: str
     destinatario: str
     identificador_fatura: str
+    telefone: str
+    numeros_vivo: list
     data_emissao: str
     data_vencimento: str
     valor: str
@@ -157,6 +159,68 @@ def ler_texto_pdf(pdf_path: Path) -> str:
     return "\n".join(paginas)
 
 
+def extrair_telefone(texto: str) -> str:
+    """Extrai o número da linha/telefone ao qual a fatura se refere.
+
+    Prioriza números próximos a rótulos como 'Linha', 'Telefone', 'No da Linha'.
+    Normaliza para o formato (XX) XXXXX-XXXX ou (XX) XXXX-XXXX.
+    """
+    # Padrões com rótulo explícito
+    padroes = [
+        # "No da Linha: (11) 99999-9999" / "Linha: 11 9999-9999"
+        r"(?:N[oº°]\.?\s*da\s*[Ll]inha|[Ll]inha|[Tt]elefone|N[uú]mero\s*da\s*[Ll]inha)"
+        r"\s*[:\-]?\s*\(?\s*(\d{2})\s*\)?\s*(\d{4,5})[\s\-\.](\d{4})",
+        # Número em destaque no cabeçalho, ex: "55 11 99999-9999"
+        r"(?:^|\s)55\s*(\d{2})\s*(\d{4,5})[\s\-\.](\d{4})(?:\s|$)",
+    ]
+    for pattern in padroes:
+        m = re.search(pattern, texto, re.IGNORECASE | re.MULTILINE)
+        if m:
+            ddd, parte1, parte2 = m.group(1), m.group(2), m.group(3)
+            return f"{ddd}-{parte1}-{parte2}"
+    # Fallback: primeiro número da seção "Número Vivo"
+    numeros = extrair_numeros_vivo(texto)
+    return numeros[0] if numeros else ""
+
+
+def _normalizar_numero(ddd: str, parte1: str, parte2: str) -> str:
+    return f"{ddd}-{parte1}-{parte2}"
+
+
+def extrair_numeros_vivo(texto: str) -> list[str]:
+    """Extrai todos os números listados na seção 'Número Vivo' da fatura.
+
+    Cobre o bloco 'VEJA OS NÚMEROS VIVO E PLANOS QUE COMPÕEM A SUA CONTA'
+    onde os números aparecem no formato XX-XXXXX-XXXX ou (XX) XXXXX-XXXX.
+    """
+    numeros: list[str] = []
+    vistos: set[str] = set()
+
+    # Localiza a seção e extrai números no bloco dela
+    secao = re.search(
+        r"N[ÚU]MEROS?\s+(?:VIVO\s+)?E\s+PLANOS[^\n]*\n([\s\S]{0,3000}?)(?:\n\s*VEJA|\n\s*Total\s+N[úu]meros|$)",
+        texto,
+        re.IGNORECASE,
+    )
+    bloco = secao.group(1) if secao else texto
+
+    # Padrão 1: XX-XXXXX-XXXX ou XX-XXXX-XXXX (formato do PDF)
+    for m in re.finditer(r"(?<!\d)(\d{2})-(\d{4,5})-(\d{4})(?!\d)", bloco):
+        num = _normalizar_numero(m.group(1), m.group(2), m.group(3))
+        if num not in vistos:
+            vistos.add(num)
+            numeros.append(num)
+
+    # Padrão 2: (XX) XXXXX-XXXX
+    for m in re.finditer(r"\((\d{2})\)\s*(\d{4,5})-(\d{4})", bloco):
+        num = _normalizar_numero(m.group(1), m.group(2), m.group(3))
+        if num not in vistos:
+            vistos.add(num)
+            numeros.append(num)
+
+    return numeros
+
+
 def extrair_destinatario(texto: str) -> str:
     match = re.search(
         r"\n([A-Z][A-Z\s\-\.]{3,})\s+CPF/CNPJ\s*:\s*[0-9./-]{11,18}",
@@ -246,6 +310,8 @@ def extrair_dados_fatura(pdf_path: str | Path, verbose: bool = True) -> dict[str
         emissor=extrair_emissor(texto, pix),
         destinatario=extrair_destinatario(texto),
         identificador_fatura=identificador_extractor.extract(texto),
+        telefone=extrair_telefone(texto),
+        numeros_vivo=extrair_numeros_vivo(texto),
         data_emissao=emissao_extractor.extract(texto),
         data_vencimento=vencimento_extractor.extract(texto),
         valor=valor_extractor.extract(texto),
