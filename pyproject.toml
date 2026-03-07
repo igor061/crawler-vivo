@@ -17,9 +17,13 @@ vivo-movel   = "vivo_movel:main"
 vivo-fixo    = "vivo_fixo:main"
 vivo-extrator = "vivo_fatura_extrator:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["vivo*"]
+[tool.setuptools]
+py-modules = [
+    "vivo_core",
+    "vivo_movel",
+    "vivo_fixo",
+    "vivo_fatura_extrator",
+]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
