@@ -2,11 +2,13 @@
 """vivo_fixo.py — Download de faturas Vivo Fixo via portal Vivo Empresas.
 
 Usa vivo_core.py para login, browser, debug e utilitários compartilhados.
+Fluxo: login → switch contexto Fixo → /sec/invoices → Ver detalhes →
+       Baixar → Boleto (.pdf)
 """
 
 import argparse
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,22 +16,18 @@ from vivo_core import (
     DEFAULT_DASHBOARD_URL,
     DEFAULT_INVOICES_URL,
     DEFAULT_URL,
-    AuthService,
     BaseConfig,
+    BaseVivoApp,
     BrowserActions,
-    DebugCollector,
+    DownloadPanelService,
     Logger,
-    NamingService,
-    ResultService,
     add_common_args,
     build_common_dirs,
+    buscar_pdf_existente,
     carregar_env_arquivo,
     coleta_data_hora_gmt_menos3,
-    enriquecer_com_extrator,
-    executar_fetch,
-    extrair_cnpj_da_pagina,
-    imprimir_resumo_telefones,
     normalize_document,
+    referencia_para_yyyymm,
     resolve_mode,
 )
 
@@ -41,37 +39,12 @@ from vivo_core import (
 @dataclass
 class FixoConfig(BaseConfig):
     limite: int | None = 2
+    force: bool = False
 
     @property
     def debug_dir(self) -> Path:
         stamp = self.coleta_dt.strftime("%Y%m%d_%H%M%S")
         return self.output_dir / f"debug_fixo_{stamp}"
-
-
-# ---------------------------------------------------------------------------
-# Helper: referência → YYYYMM
-# ---------------------------------------------------------------------------
-
-_MESES_PT: dict[str, str] = {
-    "jan": "01", "fev": "02", "mar": "03", "abr": "04",
-    "mai": "05", "jun": "06", "jul": "07", "ago": "08",
-    "set": "09", "out": "10", "nov": "11", "dez": "12",
-}
-
-
-def referencia_para_yyyymm(referencia: str) -> str:
-    """Converte 'Fev/2026', 'Fevereiro/26' ou 'Fev/26' → '202602'. Retorna '' se não parsear."""
-    m = re.match(r"([A-Za-zÀ-ú]+)[/\-](\d{2,4})", referencia.strip())
-    if not m:
-        return ""
-    mes_str = m.group(1)[:3].lower()
-    mes_str = mes_str.replace("á", "a").replace("ã", "a").replace("é", "e").replace("ê", "e")
-    ano_raw = m.group(2)
-    ano = f"20{ano_raw}" if len(ano_raw) == 2 else ano_raw
-    mes_num = _MESES_PT.get(mes_str, "")
-    if not mes_num:
-        return ""
-    return f"{ano}{mes_num}"
 
 
 # ---------------------------------------------------------------------------
@@ -188,41 +161,12 @@ class ContextSwitchService:
 class FixoDownloadService:
     def __init__(self, logger: Logger) -> None:
         self.logger = logger
-
-    def _minimizar_painel(self, page: Any) -> None:
-        """Minimiza o painel 'Download de arquivos' e rola a página ao topo."""
-        try:
-            btn = page.locator('[data-test-minimize-dialog]').first
-            if btn.count() > 0:
-                cls = btn.get_attribute("class") or ""
-                if "opened" in cls:
-                    BrowserActions.click_with_fallback(btn, timeout_ms=3000)
-                    page.wait_for_timeout(300)
-                    self.logger.log("info", "Painel de download minimizado")
-        except Exception:
-            pass
-        try:
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(200)
-        except Exception:
-            pass
-
-    def _maximizar_painel(self, page: Any) -> None:
-        try:
-            btn = page.locator('[data-test-maximize-dialog]').first
-            if btn.count() > 0:
-                cls = btn.get_attribute("class") or ""
-                if "opened" not in cls:
-                    BrowserActions.click_with_fallback(btn, timeout_ms=3000)
-                    page.wait_for_timeout(400)
-                    self.logger.log("info", "Painel de download reaberto")
-        except Exception:
-            pass
+        self.panel = DownloadPanelService(logger)
 
     def _clicar_ver_detalhes(self, page: Any, sec_locator: Any) -> bool:
-        btn = sec_locator.locator('button[data-test-detail-button]').first
+        btn = sec_locator.locator("button[data-test-detail-button]").first
         if btn.count() == 0:
-            return True
+            return True  # já expandido
         try:
             btn.scroll_into_view_if_needed(timeout=3000)
         except Exception:
@@ -234,56 +178,89 @@ class FixoDownloadService:
         self.logger.log("info", "Ver detalhes clicado")
         return True
 
-    def _obter_toggles_por_linha(self, page: Any) -> list[Any]:
-        """Retorna os toggles 'Baixar' por linha (exclui 'Baixar agora' da seção).
-        Busca no escopo da página inteira pois as linhas de detalhe renderizam fora de section.mve-grid.
+    def _obter_opcoes_no_slide(self, page: Any) -> list[dict[str, Any]]:
+        """Retorna lista de {toggle, referencia} das linhas de fatura no slide aberto.
+
+        Exclui o botão 'Baixar agora' (seção) e extrai 'Mês referência' (ex: Fev/2026)
+        de cada linha via traversal DOM.
         """
-        todos = page.locator("[data-test-drop-down] button.dropdown-toggle").all()
-        por_linha = []
-        for toggle in todos:
+        todos_dd = page.locator("[data-test-drop-down]").all()
+        opcoes = []
+        for dd in todos_dd:
+            toggle = dd.locator("button.dropdown-toggle").first
+            if toggle.count() == 0:
+                continue
             try:
                 texto = toggle.inner_text(timeout=1000) or ""
             except Exception:
                 texto = ""
-            if "agora" not in texto.lower():
-                por_linha.append(toggle)
-        return por_linha
+            if "agora" in texto.lower():
+                continue
 
-    def _aguardar_e_baixar_do_painel(
+            referencia = ""
+            try:
+                referencia = dd.evaluate("""el => {
+                    const dateRe = /^[A-Za-z\u00C0-\u017F]{3}\/\d{4}$/;
+                    let node = el;
+                    for (let depth = 0; depth < 8; depth++) {
+                        node = node.parentElement;
+                        if (!node || node.tagName === 'BODY') break;
+                        for (const child of node.children) {
+                            if (child.contains(el)) continue;
+                            const t = (child.textContent || '').trim();
+                            if (dateRe.test(t)) return t;
+                            for (const gc of child.children) {
+                                const gt = (gc.textContent || '').trim();
+                                if (dateRe.test(gt)) return gt;
+                            }
+                        }
+                    }
+                    return '';
+                }""") or ""
+            except Exception:
+                pass
+
+            opcoes.append({"toggle": toggle, "referencia": referencia})
+
+        return opcoes
+
+    def _recarregar_e_abrir_secao(
         self,
         page: Any,
+        config: "FixoConfig",
         codigo_cliente: str,
-        tipo: str = "Boleto",
-        timeout_ms: int = 120000,
-    ) -> "tuple[Path | None, str]":
-        import time
-        self._maximizar_painel(page)
-        self.logger.log("info", "Aguardando item no painel", conta=codigo_cliente, tipo=tipo)
-        deadline = time.time() + timeout_ms / 1000
-        while time.time() < deadline:
-            items = page.locator("li.download-item").all()
-            for item in items:
-                try:
-                    texto = item.inner_text(timeout=1000).strip()
-                except Exception:
-                    continue
-                if not texto.startswith(codigo_cliente):
-                    continue
-                if tipo not in texto:
-                    continue
-                dl_btn = item.locator('[data-download-available]').first
-                if dl_btn.count() == 0:
-                    continue
-                self.logger.log("ok", "Item disponivel no painel, baixando", texto=texto[:60])
-                try:
-                    with page.expect_download(timeout=30000) as dl_info:
-                        BrowserActions.click_with_fallback(dl_btn, timeout_ms=5000)
-                    dl = dl_info.value
-                    return Path(dl.path()), ""
-                except Exception as exc:
-                    return None, str(exc)
-            page.wait_for_timeout(3000)
-        return None, f"Timeout aguardando download-available ({tipo}) para {codigo_cliente}"
+    ) -> "tuple[Any | None, list[Any]]":
+        """Recarrega /sec/invoices, re-encontra a seção e expande os toggles."""
+        self.logger.log("info", "Recarregando pagina para retry", conta=codigo_cliente)
+        try:
+            page.goto(config.invoices_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(config.wait_ms)
+        except Exception as exc:
+            self.logger.log("warn", "Erro ao recarregar", erro=str(exc))
+            return None, []
+
+        sec_locator = None
+        try:
+            sections = page.locator("section.mve-grid").all()
+            for s in sections:
+                el = s.locator("[data-test-secondary-info] span").first
+                if el.count() > 0 and codigo_cliente in (el.inner_text(timeout=1500) or ""):
+                    sec_locator = s
+                    break
+        except Exception:
+            return None, []
+
+        if not sec_locator:
+            self.logger.log("warn", "Secao nao encontrada apos reload", conta=codigo_cliente)
+            return None, []
+
+        self.panel.minimizar(page)
+        if not self._clicar_ver_detalhes(page, sec_locator):
+            return None, []
+
+        page.wait_for_timeout(config.wait_ms // 2)
+        opcoes = self._obter_opcoes_no_slide(page)
+        return sec_locator, opcoes
 
     def _baixar_boleto_por_linha(
         self,
@@ -293,96 +270,137 @@ class FixoDownloadService:
         cnpj: str,
         idx_linha: int,
         referencia: str,
+        situacao: str,
         config: FixoConfig,
         runtime: dict[str, Any],
     ) -> dict[str, Any]:
-        self._minimizar_painel(page)
+        # Verifica se PDF já existe
+        ref_yyyymm = referencia_para_yyyymm(referencia) if referencia else ""
+        pdf_existente = buscar_pdf_existente(config.download_dir, "vivo-fixo", cnpj, codigo_cliente, ref_yyyymm) if ref_yyyymm else None
+        if pdf_existente and not config.force:
+            self.logger.log("info", "PDF ja existe, pulando download", arquivo=pdf_existente.name)
+            runtime["downloads_ok"] = int(runtime.get("downloads_ok", 0)) + 1
+            return {
+                "codigo_cliente": codigo_cliente,
+                "referencia": referencia,
+                "situacao": situacao,
+                "download_ok": True,
+                "arquivo_download": str(pdf_existente),
+                "erro_download": "",
+                "coleta_data_hora": config.coleta_data_hora,
+            }
+
+        self.panel.minimizar(page)
         try:
             toggle.scroll_into_view_if_needed(timeout=3000)
         except Exception:
             pass
         if not BrowserActions.click_with_fallback(toggle, timeout_ms=5000):
-            return {
-                "codigo_cliente": codigo_cliente,
-                "linha_idx": idx_linha,
-                "referencia": referencia,
-                "download_ok": False,
-                "arquivo_download": "",
-                "erro_download": "Falha ao abrir dropdown Baixar da linha",
-                "coleta_data_hora": config.coleta_data_hora,
-            }
+            return self._resultado_falha(codigo_cliente, referencia, situacao, config, "Falha ao abrir dropdown Baixar da linha")
         page.wait_for_timeout(400)
 
-        self._minimizar_painel(page)
+        self.panel.minimizar(page)
         btn_boleto = page.locator('div.dropdown.show button[data-e2e-download-bills="invoice"]').first
         try:
             btn_boleto.wait_for(state="visible", timeout=4000)
         except Exception:
             btn_boleto = page.locator('button[data-e2e-download-bills="invoice"]').first
         if btn_boleto.count() == 0:
-            return {
-                "codigo_cliente": codigo_cliente,
-                "linha_idx": idx_linha,
-                "referencia": referencia,
-                "download_ok": False,
-                "arquivo_download": "",
-                "erro_download": "Botao Boleto (.pdf) nao encontrado",
-                "coleta_data_hora": config.coleta_data_hora,
-            }
+            return self._resultado_falha(codigo_cliente, referencia, situacao, config, "Botao Boleto (.pdf) nao encontrado")
 
         self.logger.log("info", "Solicitando Boleto (.pdf)", linha=idx_linha, referencia=referencia)
-
-        tmp: Path | None = None
-        erro = ""
-        try:
-            with page.expect_download(timeout=30000) as dl_info:
-                BrowserActions.click_with_fallback(btn_boleto, timeout_ms=5000)
-            dl = dl_info.value
-            tmp = Path(dl.path())
-            self.logger.log("ok", "Download direto capturado", linha=idx_linha)
-        except Exception:
-            self.logger.log("info", "Download direto nao disparado, verificando painel", linha=idx_linha)
-            tmp, erro = self._aguardar_e_baixar_do_painel(
-                page, codigo_cliente, tipo="Boleto (.pdf)", timeout_ms=60000
-            )
+        tmp, erro = self.panel.aguardar_download(
+            page, btn_boleto, label=f"{codigo_cliente}/{referencia}"
+        )
 
         if not tmp or erro:
             runtime["downloads_falhos"] = int(runtime.get("downloads_falhos", 0)) + 1
             self.logger.log("warn", "Falha no download boleto", erro=erro, linha=idx_linha)
-            return {
-                "codigo_cliente": codigo_cliente,
-                "linha_idx": idx_linha,
-                "referencia": referencia,
-                "download_ok": False,
-                "arquivo_download": "",
-                "erro_download": erro or "Download nao capturado",
-                "coleta_data_hora": config.coleta_data_hora,
-            }
+            return self._resultado_falha(codigo_cliente, referencia, situacao, config, erro or "Download nao capturado")
 
-        # Salva com nome padronizado: vivo-fixo-{cnpj}-{conta}-{YYYYMM}.pdf
         cnpj_seguro = normalize_document(cnpj) or "semcnpj"
         cod_seguro = re.sub(r"\D", "", codigo_cliente) or "semconta"
-        ref_segura = referencia_para_yyyymm(referencia) if referencia else ""
-        if not ref_segura:
-            ref_segura = f"linha{idx_linha:02d}"
+        ref_segura = ref_yyyymm or f"linha{idx_linha:02d}"
         base = f"vivo-fixo-{cnpj_seguro}-{cod_seguro}-{ref_segura}"
         target = config.download_dir / f"{base}.pdf"
-        counter = 2
-        while target.exists():
-            target = config.download_dir / f"{base}-{counter}.pdf"
-            counter += 1
         target.write_bytes(tmp.read_bytes())
         runtime["downloads_ok"] = int(runtime.get("downloads_ok", 0)) + 1
         self.logger.log("ok", "Boleto PDF salvo", arquivo=target.name)
         return {
             "codigo_cliente": codigo_cliente,
-            "linha_idx": idx_linha,
             "referencia": referencia,
+            "situacao": situacao,
             "download_ok": True,
             "arquivo_download": str(target.resolve()),
             "erro_download": "",
             "coleta_data_hora": config.coleta_data_hora,
         }
+
+    def _resultado_falha(
+        self,
+        codigo_cliente: str,
+        referencia: str,
+        situacao: str,
+        config: FixoConfig,
+        erro: str,
+    ) -> dict[str, Any]:
+        return {
+            "codigo_cliente": codigo_cliente,
+            "referencia": referencia,
+            "situacao": situacao,
+            "download_ok": False,
+            "arquivo_download": "",
+            "erro_download": erro,
+            "coleta_data_hora": config.coleta_data_hora,
+        }
+
+    def _retry_download(
+        self,
+        page: Any,
+        config: FixoConfig,
+        runtime: dict[str, Any],
+        cnpj: str,
+        codigo_cliente: str,
+        idx: int,
+        referencia: str,
+        situacao: str,
+    ) -> "dict[str, Any] | None":
+        """Retry: recarrega página, re-abre secao e re-tenta download pelo índice."""
+        _, opcoes_retry = self._recarregar_e_abrir_secao(page, config, codigo_cliente)
+        if not opcoes_retry or idx - 1 >= len(opcoes_retry):
+            return None
+        opcao = opcoes_retry[idx - 1]
+        ref_retry = opcao.get("referencia") or referencia
+        return self._baixar_boleto_por_linha(
+            page, opcao["toggle"], codigo_cliente, cnpj, idx,
+            ref_retry, situacao, config, runtime,
+        )
+
+    def _baixar_com_retry(
+        self,
+        page: Any,
+        toggle: Any,
+        codigo_cliente: str,
+        cnpj: str,
+        idx: int,
+        referencia: str,
+        situacao: str,
+        config: FixoConfig,
+        runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        resultado = self._baixar_boleto_por_linha(
+            page, toggle, codigo_cliente, cnpj, idx, referencia, situacao, config, runtime
+        )
+        for tentativa in range(1, 4):
+            if resultado["download_ok"]:
+                break
+            self.logger.log("warn", f"Retry {tentativa}/3", referencia=referencia, conta=codigo_cliente)
+            r = self._retry_download(page, config, runtime, cnpj, codigo_cliente, idx, referencia, situacao)
+            if r is not None:
+                resultado = r
+            else:
+                break
+        return resultado
 
     def baixar_todos(
         self,
@@ -391,10 +409,6 @@ class FixoDownloadService:
         config: FixoConfig,
         runtime: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        if config.listar:
-            self.logger.log("info", "Modo listar ativo, download desabilitado")
-            return []
-
         resultados: list[dict[str, Any]] = []
         cnpj = str(runtime.get("cnpj_cliente", "") or config.cnpj_inicial or "semcnpj")
 
@@ -403,49 +417,35 @@ class FixoDownloadService:
             codigo_cliente = sec.get("codigo_cliente", "")
             faturas_sec = sec.get("faturas", [])
 
-            self._minimizar_painel(page)
+            self.panel.minimizar(page)
             if not self._clicar_ver_detalhes(page, sec_locator):
-                resultados.append({
-                    "codigo_cliente": codigo_cliente,
-                    "download_ok": False,
-                    "arquivo_download": "",
-                    "erro_download": "Falha ao expandir Ver detalhes",
-                    "coleta_data_hora": config.coleta_data_hora,
-                })
+                resultados.append(self._resultado_falha(codigo_cliente, "", "", config, "Falha ao expandir Ver detalhes"))
                 continue
 
             page.wait_for_timeout(config.wait_ms // 2)
-
-            toggles = self._obter_toggles_por_linha(page)
+            opcoes = self._obter_opcoes_no_slide(page)
             limite = config.limite
-            toggles_para_baixar = toggles if limite is None else toggles[:limite]
+            opcoes_para_baixar = opcoes if limite is None else opcoes[:limite]
             self.logger.log(
                 "info", "Faturas para download",
-                total_disponiveis=len(toggles),
-                baixando=len(toggles_para_baixar),
+                total_disponiveis=len(opcoes),
+                baixando=len(opcoes_para_baixar),
                 conta=codigo_cliente,
             )
 
-            if not toggles:
-                resultados.append({
-                    "codigo_cliente": codigo_cliente,
-                    "download_ok": False,
-                    "arquivo_download": "",
-                    "erro_download": "Nenhuma linha de download encontrada apos Ver detalhes",
-                    "coleta_data_hora": config.coleta_data_hora,
-                })
+            if not opcoes:
+                resultados.append(self._resultado_falha(codigo_cliente, "", "", config, "Nenhuma linha de download encontrada"))
                 continue
 
-            for idx, toggle in enumerate(toggles_para_baixar, start=1):
-                referencia = (
-                    faturas_sec[idx - 1].get("referencia", "")
-                    if idx - 1 < len(faturas_sec) else ""
-                )
+            for idx, opcao in enumerate(opcoes_para_baixar, start=1):
+                fatura = faturas_sec[idx - 1] if idx - 1 < len(faturas_sec) else {}
+                referencia = opcao.get("referencia") or fatura.get("referencia", "")
+                situacao = fatura.get("situacao", "")
                 runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
-                resultado = self._baixar_boleto_por_linha(
-                    page, toggle, codigo_cliente, cnpj, idx, referencia, config, runtime
-                )
-                resultados.append(resultado)
+                resultados.append(self._baixar_com_retry(
+                    page, opcao["toggle"], codigo_cliente, cnpj, idx,
+                    referencia, situacao, config, runtime,
+                ))
                 page.wait_for_timeout(500)
 
         return resultados
@@ -455,56 +455,21 @@ class FixoDownloadService:
 # App principal Fixo
 # ---------------------------------------------------------------------------
 
-class VivoFixoApp:
+class VivoFixoApp(BaseVivoApp):
+    PREFIXO_RESULTADO = "vivo_fixo_resultado"
+    PDF_PREFIXO = "vivo-fixo"
+    TITULO_TABELA = "LISTAGEM DE FATURAS VIVO FIXO"
+
     def __init__(self, config: FixoConfig) -> None:
-        self.config = config
-        self.logger = Logger()
-        self.debug = DebugCollector(config, self.logger)
-        self.auth_service = AuthService(self.logger)
+        super().__init__(config)
         self.context_service = ContextSwitchService(self.logger)
         self.download_service = FixoDownloadService(self.logger)
-        self.result_service = ResultService(NamingService())
-        self.runtime: dict[str, Any] = {
-            "campo_senha_detectado": False,
-            "senha_enviada": False,
-            "dashboard_detectado": False,
-            "contexto_fixo_ok": False,
-            "faturas_aberto": False,
-            "tentativas": 0,
-            "downloads_ok": 0,
-            "downloads_falhos": 0,
-            "faturas_disponiveis": [],
-            "cnpj_cliente": config.cnpj_inicial,
-            "erro_execucao": "",
-            "debug_paginas": 0,
-        }
+        self.runtime["contexto_fixo_ok"] = False
 
-    def run(self) -> Path:
-        response = executar_fetch(self.config, self._page_action, self.runtime)
-        result_file = self.result_service.salvar_resultado(
-            response, self.config, self.runtime,
-            extra={
-                "contexto_fixo_ok": self.runtime["contexto_fixo_ok"],
-                "tentativas": self.runtime["tentativas"],
-            },
-            prefixo="vivo_fixo_resultado",
-        )
-        self.logger.log("ok", "Execucao finalizada", status=response.status)
-        self.logger.log("ok", "Resumo", downloads_ok=self.runtime["downloads_ok"])
-        self.logger.log("ok", "Resumo", downloads_falhos=self.runtime["downloads_falhos"])
-        imprimir_resumo_telefones(self.runtime["faturas_disponiveis"], self.logger)
-        self.logger.log("ok", "Resultado salvo", arquivo=result_file)
-        return result_file
+    def _extra_result(self) -> dict[str, Any]:
+        return {"contexto_fixo_ok": self.runtime.get("contexto_fixo_ok", False)}
 
-    def _page_action(self, page: Any) -> Any:
-        self.logger.log("info", "Pagina inicial", url=self.config.url)
-        page.wait_for_timeout(self.config.wait_ms)
-        self.debug.capture(page, "01_login_page", self.runtime)
-
-        if not self.auth_service.executar_login(page, self.config, self.runtime):
-            self.logger.log("warn", "Login falhou")
-            return page
-
+    def _pos_login(self, page: Any) -> None:
         if self.config.dashboard_url not in (page.url or ""):
             self.logger.log("info", "Navegando ao dashboard explicitamente")
             try:
@@ -512,38 +477,21 @@ class VivoFixoApp:
                 page.wait_for_timeout(self.config.wait_ms)
             except Exception as exc:
                 self.logger.log("warn", "Falha ao navegar ao dashboard", erro=str(exc))
-
         try:
-            page.locator("#service-select-desktop").first.wait_for(
-                state="visible", timeout=20000
-            )
+            page.locator("#service-select-desktop").first.wait_for(state="visible", timeout=20000)
         except Exception:
             pass
-        self.debug.capture(page, "02_apos_login", self.runtime)
-
         ok = self.context_service.selecionar_vivo_fixo(page, self.config)
         self.runtime["contexto_fixo_ok"] = ok
         if not ok:
             self.logger.log("warn", "Troca para Vivo Fixo falhou")
-        self.debug.capture(page, "03_contexto_fixo", self.runtime)
 
-        try:
-            page.goto(self.config.invoices_url, wait_until="domcontentloaded")
-            page.wait_for_timeout(self.config.wait_ms)
-            self.runtime["faturas_aberto"] = "/sec/invoices" in (page.url or "")
-        except Exception as exc:
-            self.logger.log("erro", "Falha ao abrir faturas", erro=str(exc))
-            return page
-
-        cnpj = extrair_cnpj_da_pagina(page.content())
-        if cnpj:
-            self.runtime["cnpj_cliente"] = cnpj
-            self.logger.log("ok", "CNPJ extraido", cnpj=cnpj)
-        self.debug.capture(page, "04_faturas", self.runtime)
-
+    def _coletar_secoes(self, page: Any) -> list[dict[str, Any]]:
         secoes = _extrair_secoes_fixo(page, self.config, self.logger)
         self.logger.log("info", "Secoes fixo coletadas", total=len(secoes))
+        return secoes
 
+    def _popular_faturas(self, secoes: list[dict[str, Any]]) -> None:
         for sec in secoes:
             for fat in sec.get("faturas", []):
                 self.runtime["faturas_disponiveis"].append({
@@ -555,18 +503,8 @@ class VivoFixoApp:
                     "coleta_data_hora": self.config.coleta_data_hora,
                 })
 
-        resultados = self.download_service.baixar_todos(
-            page, secoes, self.config, self.runtime
-        )
-
-        for item in resultados:
-            enriquecer_com_extrator(item)
-
-        if resultados:
-            self.runtime["faturas_disponiveis"] = resultados
-
-        self.debug.capture(page, "05_final", self.runtime)
-        return page
+    def _baixar_ou_listar(self, page: Any, secoes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self.download_service.baixar_todos(page, secoes, self.config, self.runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +516,7 @@ def parse_args() -> argparse.Namespace:
         description="Download de faturas Vivo Fixo via portal Vivo Empresas"
     )
     add_common_args(parser)
+    parser.set_defaults(mode="headless")
     parser.add_argument(
         "--limite", type=int, default=2, metavar="N",
         help="Numero maximo de faturas para baixar por conta (default: 2)",
@@ -585,6 +524,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--todas", action="store_true",
         help="Baixar todas as faturas disponiveis (ignora --limite)",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Forca re-download mesmo se o PDF ja existir",
     )
     return parser.parse_args()
 
@@ -607,6 +550,7 @@ def build_config(args: argparse.Namespace) -> FixoConfig:
         mode=resolve_mode(args),
         coleta_dt=coleta_data_hora_gmt_menos3(),
         limite=limite,
+        force=getattr(args, "force", False),
     )
 
 
@@ -614,8 +558,7 @@ def main() -> None:
     carregar_env_arquivo(Path(".env"))
     args = parse_args()
     config = build_config(args)
-    app = VivoFixoApp(config)
-    app.run()
+    VivoFixoApp(config).run()
 
 
 if __name__ == "__main__":

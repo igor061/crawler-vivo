@@ -50,6 +50,7 @@ class FaturaExtraida:
     data_emissao: str
     data_vencimento: str
     valor: str
+    url_nfe: str
     metodo_extracao: MetodoExtracao
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,6 +168,8 @@ def extrair_telefone(texto: str) -> str:
     """
     # Padrões com rótulo explícito
     padroes = [
+        # "TELEFONE PRINCIPAL: (61) 3627-6761"
+        r"TELEFONE\s+PRINCIPAL\s*[:\-]?\s*\(?(\d{2})\)?\s*(\d{4,5})[\s\-\.](\d{4})",
         # "No da Linha: (11) 99999-9999" / "Linha: 11 9999-9999"
         r"(?:N[oº°]\.?\s*da\s*[Ll]inha|[Ll]inha|[Tt]elefone|N[uú]mero\s*da\s*[Ll]inha)"
         r"\s*[:\-]?\s*\(?\s*(\d{2})\s*\)?\s*(\d{4,5})[\s\-\.](\d{4})",
@@ -219,6 +222,72 @@ def extrair_numeros_vivo(texto: str) -> list[str]:
             numeros.append(num)
 
     return numeros
+
+
+def extrair_url_nfe(texto: str) -> str:
+    """Extrai a URL de consulta da NF-e/NFCom, reconstruindo linhas quebradas.
+
+    O PDF pode quebrar a URL em qualquer ponto (no '?', no meio da query string,
+    ou até em múltiplas linhas). Junta os fragmentos até encontrar linha de código
+    de barras ou novo rótulo.
+    """
+    m = re.search(r"Consulte\s+pela\s+Chave\s+de\s+Acesso\s+em", texto, re.IGNORECASE)
+    if not m:
+        m2 = re.search(r"(https?://(?:dfe-portal|[^\s]*nfcom)\S+)", texto, re.IGNORECASE)
+        return m2.group(1) if m2 else ""
+
+    # Coleta linhas após o rótulo e junta os fragmentos (sem separador)
+    # para reconstruir URL partida em qualquer ponto
+    after = texto[m.end(): m.end() + 600]
+    fragmentos: list[str] = []
+    for line in after.splitlines():
+        stripped = line.strip()
+        # Para em linha de código de barras: "5226 0202 5581 ..."
+        if re.match(r"^\d{4}\s+\d{4}", stripped):
+            break
+        # Para em novo rótulo que segue a URL (ex: "Protocolo de Autorização:")
+        if fragmentos and re.match(r"^[A-Z][a-záéíóú]+\s", stripped):
+            break
+        fragmentos.append(stripped)
+        if len(fragmentos) > 8:
+            break
+
+    flat = "".join(fragmentos)
+
+    # Localiza início da URL
+    url_start = re.search(r"https?://", flat, re.IGNORECASE)
+    if not url_start:
+        return ""
+
+    # Remove espaços internos (pypdf pode inserir espaços dentro de URLs longas)
+    url_region = re.sub(r"\s+", "", flat[url_start.start():])
+
+    # Prefere match até terminador padrão NFCom/NFe (tpAmb=N); senão, pega tudo até espaço
+    url = ""
+    for pattern in [
+        r"(https?://[^\s<>\"']+?tpAmb=\d+)",
+        r"(https?://[^\s<>\"']+)",
+    ]:
+        m2 = re.match(pattern, url_region)
+        if m2:
+            url = m2.group(1)
+            break
+
+    if not url:
+        return ""
+
+    # Caso Móvel: URL termina com "?chNFCom" sem o valor — chave está na linha
+    # "Chave de acesso: \n<44 dígitos>" logo abaixo no PDF
+    if url.rstrip("=").endswith("chNFCom") and "=" not in url.split("chNFCom")[-1]:
+        chave_m = re.search(
+            r"Chave\s+de\s+acesso\s*:?\s*\n?\s*(\d{40,50})",
+            after,
+            re.IGNORECASE,
+        )
+        if chave_m:
+            url = url.rstrip("=") + "=" + chave_m.group(1).strip() + "&tpAmb=1"
+
+    return url
 
 
 def extrair_destinatario(texto: str) -> str:
@@ -315,6 +384,7 @@ def extrair_dados_fatura(pdf_path: str | Path, verbose: bool = True) -> dict[str
         data_emissao=emissao_extractor.extract(texto),
         data_vencimento=vencimento_extractor.extract(texto),
         valor=valor_extractor.extract(texto),
+        url_nfe=extrair_url_nfe(texto),
         metodo_extracao=MetodoExtracao(
             texto_pdf=bool(texto.strip()),
             qr_decode=bool(pix),
@@ -334,17 +404,17 @@ def main() -> None:
     args = parse_args()
     resultado = extrair_dados_fatura(args.pdf, verbose=True)
 
+    log_event("ok", "Resumo", identificador=resultado["identificador_fatura"])
+    log_event("ok", "Resumo", vencimento=resultado["data_vencimento"], valor=resultado["valor"])
+
     if args.salvar:
         pdf_path = Path(args.pdf).expanduser().resolve()
         output_path = output_path_for(pdf_path)
         destino = salvar_resultado_json(resultado, output_path)
         log_event("ok", "Extracao finalizada", output=destino)
     else:
-        print(json.dumps(resultado, ensure_ascii=False, indent=2))
         log_event("ok", "Extracao finalizada", output="stdout")
-
-    log_event("ok", "Resumo", identificador=resultado["identificador_fatura"])
-    log_event("ok", "Resumo", vencimento=resultado["data_vencimento"], valor=resultado["valor"])
+        print(json.dumps(resultado, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

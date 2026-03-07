@@ -356,6 +356,7 @@ def enriquecer_com_extrator(item: dict[str, Any]) -> dict[str, Any]:
     item["identificador_fatura"] = str(dados.get("identificador_fatura", "")).strip()
     item["telefone"] = str(dados.get("telefone", "")).strip()
     item["numeros_vivo"] = dados.get("numeros_vivo") or []
+    item["url_nfe"] = str(dados.get("url_nfe", "")).strip()
     item["data_emissao"] = str(dados.get("data_emissao", "")).strip()
     data_venc = str(dados.get("data_vencimento", "")).strip()
     if data_venc:
@@ -558,3 +559,363 @@ def build_common_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
 
 def resolve_mode(args: argparse.Namespace) -> str:
     return "headful" if getattr(args, "show", False) else args.mode
+
+
+# ---------------------------------------------------------------------------
+# BaseVivoApp — template de fluxo compartilhado por Móvel e Fixo
+# ---------------------------------------------------------------------------
+
+class BaseVivoApp:
+    """Classe base para apps de automação Vivo (Móvel e Fixo).
+
+    Implementa o fluxo completo via template method:
+      login → _pos_login() → invoices → _coletar_secoes() → _popular_faturas()
+      → _baixar_ou_listar() → enriquecimento PDF → salvar JSON
+
+    Subclasses sobrescrevem os hooks e as constantes de classe.
+    """
+
+    PREFIXO_RESULTADO: str = "vivo_resultado"
+    PDF_PREFIXO: str = "vivo"
+    TITULO_TABELA: str = "FATURAS VIVO"
+
+    def __init__(self, config: BaseConfig) -> None:
+        self.config = config
+        self.logger = Logger()
+        self.debug = DebugCollector(config, self.logger)
+        self.auth_service = AuthService(self.logger)
+        self.result_service = ResultService(NamingService())
+        self.runtime: dict[str, Any] = {
+            "campo_senha_detectado": False,
+            "senha_enviada": False,
+            "dashboard_detectado": False,
+            "faturas_aberto": False,
+            "tentativas": 0,
+            "downloads_ok": 0,
+            "downloads_falhos": 0,
+            "faturas_disponiveis": [],
+            "cnpj_cliente": config.cnpj_inicial,
+            "erro_execucao": "",
+            "debug_paginas": 0,
+        }
+
+    # --- hooks para subclasses ---
+
+    def _extra_result(self) -> dict[str, Any]:
+        """Campos extras para o JSON de resultado (específicos de cada script)."""
+        return {}
+
+    def _pos_login(self, page: Any) -> None:
+        """Executado após login e antes de navegar para /sec/invoices.
+        Ex: troca de contexto Móvel → Fixo.
+        """
+        pass
+
+    def _coletar_secoes(self, page: Any) -> list[dict[str, Any]]:
+        """Coleta metadados das seções/contas na grade de faturas."""
+        raise NotImplementedError
+
+    def _popular_faturas(self, secoes: list[dict[str, Any]]) -> None:
+        """Preenche runtime['faturas_disponiveis'] com dados resumidos das seções."""
+        raise NotImplementedError
+
+    def _baixar_ou_listar(
+        self, page: Any, secoes: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Executa o download (ou listagem) e retorna os resultados."""
+        raise NotImplementedError
+
+    # --- fluxo principal ---
+
+    def run(self) -> Path:
+        response = executar_fetch(self.config, self._page_action, self.runtime)
+        result_file = self.result_service.salvar_resultado(
+            response,
+            self.config,
+            self.runtime,
+            extra={"tentativas": self.runtime["tentativas"], **self._extra_result()},
+            prefixo=self.PREFIXO_RESULTADO,
+        )
+        self.logger.log("ok", "Execucao finalizada", status=response.status)
+        self.logger.log("ok", "Resumo", downloads_ok=self.runtime["downloads_ok"])
+        self.logger.log("ok", "Resumo", downloads_falhos=self.runtime["downloads_falhos"])
+        imprimir_resumo_telefones(self.runtime["faturas_disponiveis"], self.logger)
+        if self.config.listar:
+            imprimir_tabela_listagem(
+                self.runtime["faturas_disponiveis"], titulo=self.TITULO_TABELA
+            )
+        self.logger.log("ok", "Resultado salvo", arquivo=result_file)
+        return result_file
+
+    def _page_action(self, page: Any) -> Any:
+        self.logger.log("info", "Pagina inicial", url=self.config.url)
+        page.wait_for_timeout(self.config.wait_ms)
+        self.debug.capture(page, "01_login_page", self.runtime)
+
+        if not self.auth_service.executar_login(page, self.config, self.runtime):
+            self.logger.log("warn", "Login falhou")
+            return page
+        self.debug.capture(page, "02_apos_login", self.runtime)
+
+        self._pos_login(page)
+
+        try:
+            page.goto(self.config.invoices_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(self.config.wait_ms)
+            self.runtime["faturas_aberto"] = "/sec/invoices" in (page.url or "")
+        except Exception as exc:
+            self.logger.log("erro", "Falha ao abrir faturas", erro=str(exc))
+            return page
+
+        cnpj = extrair_cnpj_da_pagina(page.content())
+        if cnpj:
+            self.runtime["cnpj_cliente"] = cnpj
+            self.logger.log("ok", "CNPJ extraido", cnpj=cnpj)
+        self.debug.capture(page, "03_faturas", self.runtime)
+
+        secoes = self._coletar_secoes(page)
+        self._popular_faturas(secoes)
+
+        resultados = self._baixar_ou_listar(page, secoes)
+
+        cnpj_str = str(self.runtime.get("cnpj_cliente", "") or self.config.cnpj_inicial or "")
+        for item in resultados:
+            if not item.get("arquivo_download"):
+                ref = item.get("referencia", "")
+                # Suporta tanto YYYYMM (Móvel) quanto "Fev/2026" (Fixo)
+                ref_key = referencia_para_yyyymm(ref) or ref
+                if ref_key:
+                    pdf = buscar_pdf_existente(
+                        self.config.download_dir,
+                        self.PDF_PREFIXO,
+                        cnpj_str,
+                        item.get("codigo_cliente", ""),
+                        ref_key,
+                    )
+                    if pdf:
+                        item["arquivo_download"] = str(pdf)
+                        item["download_ok"] = True
+            enriquecer_com_extrator(item)
+
+        if resultados:
+            self.runtime["faturas_disponiveis"] = resultados
+
+        self.debug.capture(page, "04_final", self.runtime)
+        return page
+
+
+# ---------------------------------------------------------------------------
+# Referência → YYYYMM
+# ---------------------------------------------------------------------------
+
+_MESES_PT: dict[str, str] = {
+    "jan": "01", "fev": "02", "mar": "03", "abr": "04",
+    "mai": "05", "jun": "06", "jul": "07", "ago": "08",
+    "set": "09", "out": "10", "nov": "11", "dez": "12",
+}
+
+
+def referencia_para_yyyymm(referencia: str) -> str:
+    """Converte 'Fev/2026', 'Fevereiro/26' ou 'Fev/26' → '202602'. Retorna '' se não parsear."""
+    m = re.match(r"([A-Za-zÀ-ú]+)[/\-](\d{2,4})", referencia.strip())
+    if not m:
+        return ""
+    mes_str = m.group(1)[:3].lower()
+    mes_str = mes_str.replace("á", "a").replace("ã", "a").replace("é", "e").replace("ê", "e")
+    ano_raw = m.group(2)
+    ano = f"20{ano_raw}" if len(ano_raw) == 2 else ano_raw
+    mes_num = _MESES_PT.get(mes_str, "")
+    if not mes_num:
+        return ""
+    return f"{ano}{mes_num}"
+
+
+# ---------------------------------------------------------------------------
+# buscar_pdf_existente
+# ---------------------------------------------------------------------------
+
+def buscar_pdf_existente(
+    download_dir: Path,
+    prefixo: str,
+    cnpj: str,
+    conta: str,
+    referencia: str,
+) -> "Path | None":
+    """Procura PDF já baixado para a combinação prefixo/cnpj/conta/referencia."""
+    cnpj_s = re.sub(r"\D", "", cnpj)
+    conta_s = re.sub(r"\D", "", conta)
+    padrao = f"{prefixo}-{cnpj_s}-{conta_s}-{referencia}*.pdf"
+    candidatos = sorted(download_dir.glob(padrao))
+    return candidatos[0] if candidatos else None
+
+
+# ---------------------------------------------------------------------------
+# DownloadPanelService — operações compartilhadas no painel de download
+# ---------------------------------------------------------------------------
+
+class DownloadPanelService:
+    """Gerencia o painel flutuante de downloads do portal Vivo Empresas."""
+
+    def __init__(self, logger: Logger) -> None:
+        self.logger = logger
+
+    def cancelar_dialog_se_visivel(self, page: Any) -> None:
+        """Fecha o dialog 'Cancelar download' se aparecer."""
+        try:
+            btn = page.locator(
+                "[data-test-close-dialog], button[aria-label*='Cancelar download']"
+            ).first
+            if btn.count() > 0 and btn.is_visible():
+                BrowserActions.click_with_fallback(btn, timeout_ms=3000)
+                page.wait_for_timeout(500)
+                self.logger.log("info", "Dialog cancelar clicado")
+                for sel in [
+                    "button:has-text('Sim, cancelar')",
+                    "button:has-text('Sim')",
+                    "[data-test-confirm-cancel]",
+                ]:
+                    b = page.locator(sel).first
+                    if b.count() > 0 and b.is_visible():
+                        BrowserActions.click_with_fallback(b, timeout_ms=3000)
+                        page.wait_for_timeout(500)
+                        break
+        except Exception:
+            pass
+
+    def minimizar(self, page: Any) -> None:
+        """Cancela dialog pendente e minimiza o painel de download."""
+        self.cancelar_dialog_se_visivel(page)
+        try:
+            btn = page.locator("[data-test-minimize-dialog]").first
+            if btn.count() > 0:
+                cls = btn.get_attribute("class") or ""
+                if "opened" in cls:
+                    BrowserActions.click_with_fallback(btn, timeout_ms=3000)
+                    page.wait_for_timeout(300)
+                    self.logger.log("info", "Painel minimizado")
+        except Exception:
+            pass
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    def tem_falha(self, page: Any) -> bool:
+        """Verifica se o painel mostra 'Tentar novamente' (falha do servidor)."""
+        try:
+            return (
+                page.locator(
+                    "li.download-item:has-text('Tentar novamente'), "
+                    "li.download-item:has-text('Falha no download')"
+                ).count()
+                > 0
+            )
+        except Exception:
+            return False
+
+    def aguardar_download(
+        self,
+        page: Any,
+        btn: Any,
+        label: str = "",
+        timeout_ms: int = 60000,
+    ) -> "tuple[Path | None, str]":
+        """Clica no botão e monitora download via polling a cada 2s.
+
+        Detecta falha no painel rapidamente para não esperar o timeout inteiro.
+        """
+        downloaded: list[Any] = []
+
+        def on_download(dl: Any) -> None:
+            downloaded.append(dl)
+
+        page.on("download", on_download)
+        try:
+            BrowserActions.click_with_fallback(btn, timeout_ms=5000)
+        except Exception as exc:
+            page.remove_listener("download", on_download)
+            return None, f"Falha ao clicar: {exc}"
+
+        elapsed = 0
+        poll_ms = 2000
+        while elapsed < timeout_ms:
+            if downloaded:
+                page.remove_listener("download", on_download)
+                if label:
+                    self.logger.log("ok", "Download capturado", label=label)
+                return Path(downloaded[0].path()), ""
+            if self.tem_falha(page):
+                page.remove_listener("download", on_download)
+                self.logger.log("warn", "Falha detectada no painel", label=label)
+                return None, "Falha detectada no painel (Tentar novamente)"
+            page.wait_for_timeout(poll_ms)
+            elapsed += poll_ms
+
+        page.remove_listener("download", on_download)
+        return None, f"Timeout {timeout_ms}ms aguardando download"
+
+
+# ---------------------------------------------------------------------------
+# imprimir_tabela_listagem
+# ---------------------------------------------------------------------------
+
+def imprimir_tabela_listagem(
+    faturas: list[dict[str, Any]],
+    titulo: str = "FATURAS VIVO",
+) -> None:
+    """Imprime tabela formatada usando dados já enriquecidos nos itens."""
+    linhas = []
+    for f in faturas:
+        conta   = f.get("codigo_cliente", "")
+        ref     = f.get("referencia", "")
+        venc    = f.get("vencimento", "") or f.get("data_vencimento", "") or "-"
+        sit     = f.get("situacao", "")
+        valor   = f.get("valor", "") or "-"
+        arquivo = f.get("arquivo_download", "") or "-"
+        cb = (
+            f.get("codigo_de_barras_sem_espaco")
+            or f.get("codigo_barras_digitavel_sem_espaco")
+            or ""
+        )
+        pix = (f.get("pix_copia_cola") or "")[:40]
+        linhas.append({
+            "conta": conta, "ref": ref, "vencimento": venc,
+            "situacao": sit, "valor": valor, "arquivo": arquivo,
+            "codigo_barras": cb or "-", "pix": pix or "-",
+        })
+
+    if not linhas:
+        print("\n[info] Nenhuma fatura encontrada para listar.")
+        return
+
+    col_conta = max(len("Conta"),      max(len(r["conta"])      for r in linhas))
+    col_ref   = max(len("Referência"), max(len(r["ref"])        for r in linhas))
+    col_venc  = max(len("Vencimento"), max(len(r["vencimento"]) for r in linhas))
+    col_sit   = max(len("Situação"),   max(len(r["situacao"])   for r in linhas))
+    col_valor = max(len("Valor"),      max(len(r["valor"])      for r in linhas))
+    col_arq   = max(len("Arquivo"),    max(len(r["arquivo"])    for r in linhas))
+
+    sep = (
+        f"+{'-'*(col_conta+2)}+{'-'*(col_ref+2)}+{'-'*(col_venc+2)}"
+        f"+{'-'*(col_sit+2)}+{'-'*(col_valor+2)}+{'-'*(col_arq+2)}+"
+    )
+    fmt = (
+        f"| {{:<{col_conta}}} | {{:<{col_ref}}} | {{:<{col_venc}}}"
+        f" | {{:<{col_sit}}} | {{:<{col_valor}}} | {{:<{col_arq}}} |"
+    )
+
+    print(f"\n{'='*len(sep)}")
+    print(f"  {titulo}")
+    print(sep)
+    print(fmt.format("Conta", "Referência", "Vencimento", "Situação", "Valor", "Arquivo"))
+    print(sep)
+    for r in linhas:
+        print(fmt.format(r["conta"], r["ref"], r["vencimento"], r["situacao"], r["valor"], r["arquivo"]))
+        if r["codigo_barras"] != "-":
+            print(f"|  Cód.Barras: {r['codigo_barras']}")
+        if r["pix"] != "-":
+            print(f"|  PIX:        {r['pix']}")
+    print(sep)
+    print(f"  Total: {len(linhas)} fatura(s)")
+    print(f"{'='*len(sep)}\n")

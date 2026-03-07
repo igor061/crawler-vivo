@@ -30,18 +30,22 @@ pytest
 pytest tests/test_vivo_fatura_extrator.py::test_arrecadacao_extractor_prioritizes_48_digit_format
 
 # Vivo Móvel — full flow (login, list, download, JSON)
-python vivo_download.py
+python vivo_movel.py
 
 # Vivo Fixo — full flow (switches context to Fixo before listing/downloading)
-python vivo_download_fixo.py
+python vivo_fixo.py
 
 # List invoices only (no download) — both scripts support --listar
-python vivo_download.py --listar
-python vivo_download_fixo.py --listar
+python vivo_movel.py --listar
+python vivo_fixo.py --listar
 
 # Debug mode (saves HTML + screenshots per step)
-python vivo_download.py --debug
-python vivo_download_fixo.py --debug
+python vivo_movel.py --debug
+python vivo_fixo.py --debug
+
+# Force re-download even if PDF already exists
+python vivo_movel.py --force
+python vivo_fixo.py --force
 
 # Extract data from a PDF
 python vivo_fatura_extrator.py /path/to/fatura.pdf
@@ -50,19 +54,19 @@ python vivo_fatura_extrator.py /path/to/fatura.pdf --salvar
 
 ## Architecture
 
-Two independent scripts with no shared module:
+Three modules with clear separation of concerns:
 
-**`vivo_download_fixo.py`** — Same structure as `vivo_download.py` but adds a `ContextSwitchService` step after login: clicks the "Vivo Móvel ∨" dropdown in the header, then clicks "Vivo Fixo" in the sidebar panel. Uses CSS text selectors (`button:has-text`, `h1:has-text`) with multiple absolute XPath fallbacks (the overlay `div` index varies). After switching, navigates to `/sec/invoices` and runs the same XPath-loop collection/download/enrichment flow. Output files are prefixed `vivo-fixo-` and the JSON result is `vivo_fixo_resultado_{cnpj}_{timestamp}.json`.
+**`vivo_core.py`** — Shared library. Contains `BaseConfig`, `BaseVivoApp` (template method base class), `AuthService`, `DebugCollector`, `BrowserActions`, `DownloadPanelService`, `ResultService`, `NamingService`, and utilities (`referencia_para_yyyymm`, `buscar_pdf_existente`, `enriquecer_com_extrator`, `imprimir_tabela_listagem`). The `executar_fetch` function drives `StealthyFetcher` (Playwright + Camoufox).
 
-**`vivo_download.py`** — Main automation flow for Vivo Móvel. Uses `scrapling.StealthyFetcher` (Playwright + Camoufox under the hood) to drive a browser session. The entry point is `VivoDownloadApp.run()`, which calls `StealthyFetcher.fetch()` with a `page_action` callback. The page action orchestrates three service classes sequentially:
-- `AuthService` — fills CPF/CNPJ, advances through the multi-step login, fills password
-- `InvoiceService` — navigates to `/sec/invoices`, iterates XPath-addressed rows (section × div index loops) via `XPathInvoiceCollectionStrategy` to collect invoice metadata
-- `DownloadService` — clicks the toggle button and download link for each invoice, saves PDF to `downloads/vivo/` with a `vivo-{cnpj}-{conta}-{year}-{month}.pdf` naming convention
-- `ResultService` — enriches invoice data from the extractor and writes a JSON summary
+**`BaseVivoApp`** template flow: `login → _pos_login() → goto /sec/invoices → _coletar_secoes() → _popular_faturas() → _baixar_ou_listar() → enriquecer PDFs → salvar JSON`. Subclasses override the hook methods and class constants (`PREFIXO_RESULTADO`, `PDF_PREFIXO`, `TITULO_TABELA`).
 
-After download, `ResultService._enriquecer_com_extrator` dynamically imports `vivo_fatura_extrator.extrair_dados_fatura` to enrich each invoice entry with barcode, PIX, dates, and value from the PDF.
+**`vivo_movel.py`** — `VivoMovelApp(BaseVivoApp)` for Vivo Móvel. Uses DOM selectors on `section[data-test-invoices-line-grid]` to collect accounts, then `MovelDownloadService` opens each account's detail slide, finds toggles via `datacardsection[data-test-card-section-content]`, and downloads "Conta detalhada e nota fiscal" PDFs. Output prefixed `vivo-movel-`.
 
-**`vivo_fatura_extrator.py`** — Standalone PDF extractor. Uses `pypdf` for text extraction, regex chains (`RegexChainExtractor`) for field parsing, and optionally `opencv`/`pymupdf` for QR decoding (`PixQrExtractor`). Can be imported as a library or run as a CLI.
+**`vivo_fixo.py`** — `VivoFixoApp(BaseVivoApp)` for Vivo Fixo. `_pos_login` adds `ContextSwitchService` step (clicks `#service-select-desktop` → `[data-service-id="WIR"]`). `FixoDownloadService` opens each line's "Ver detalhes", finds `[data-test-drop-down]` toggles (JS DOM traversal to extract "Fev/2026"-style referência), and downloads boleto PDFs. Output prefixed `vivo-fixo-`.
+
+**`vivo_fatura_extrator.py`** — Standalone PDF extractor. Uses `pypdf` for text extraction, regex chains (`RegexChainExtractor`) for field parsing, and optionally `opencv`/`pymupdf` for QR decoding (`PixQrExtractor`). Extracts: barcode, PIX, NFe URL, phone, dates, value. Can be imported as a library or run as a CLI.
+
+**`DownloadPanelService`** — Shared service managing the floating download panel: `cancelar_dialog_se_visivel`, `minimizar`, `tem_falha` (detects "Tentar novamente"), `aguardar_download` (2s polling loop, not `page.expect_download`).
 
 ## Credentials
 
@@ -76,10 +80,11 @@ Or as environment variables `VIVO_CPF` / `VIVO_PASSWORD`.
 
 ## Outputs
 
-- PDFs: `downloads/vivo/vivo-{cnpj}-{conta}-{year}-{month}.pdf`
-- Result JSON: `downloads/vivo/vivo_download_resultado_{cnpj}_{timestamp}.json`
-- Debug snapshots (with `--debug`): `screenshots/scrapling/debug_xpath_loop_{timestamp}/`
+- Móvel PDFs: `downloads/vivo/vivo-movel-{cnpj}-{conta}-{yyyymm}.pdf`
+- Fixo PDFs: `downloads/vivo/vivo-fixo-{cnpj}-{conta}-{yyyymm}.pdf`
+- Result JSON: `downloads/vivo/vivo_movel_resultado_{cnpj}_{timestamp}.json` (or `vivo_fixo_resultado_...`)
+- Debug snapshots (with `--debug`): `screenshots/scrapling/debug_movel_{timestamp}/` or `debug_fixo_{timestamp}/`
 
 ## Testing Patterns
 
-Tests use `monkeypatch` to stub `ler_texto_pdf` and `PixQrExtractor.extract` — no real PDFs required. Browser-dependent code in `vivo_download.py` is tested via service classes directly with fake strategies/mocks, not end-to-end.
+Tests use `monkeypatch` to stub `ler_texto_pdf` and `PixQrExtractor.extract` — no real PDFs required. `tests/test_vivo_core.py` covers shared utilities (`referencia_para_yyyymm`, `buscar_pdf_existente`, `enriquecer_com_extrator`, etc.) imported directly from `vivo_core`.

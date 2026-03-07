@@ -1,422 +1,493 @@
 #!/usr/bin/env python3
-"""vivo_movel.py — Download de faturas Vivo Móvel via portal Vivo Empresas.
+"""vivo_movel.py — Download de contas detalhadas Vivo Móvel.
 
-Usa vivo_core.py para login, browser, debug e utilitários compartilhados.
+Fluxo: login → /sec/invoices → por conta: Exibir detalhes →
+       por fatura: Opções → Conta detalhada e nota fiscal (.pdf)
 """
 
 import argparse
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from vivo_core import (
     DEFAULT_DASHBOARD_URL,
     DEFAULT_INVOICES_URL,
     DEFAULT_URL,
-    AuthService,
     BaseConfig,
+    BaseVivoApp,
     BrowserActions,
-    DebugCollector,
+    DownloadPanelService,
     Logger,
-    NamingService,
-    ResultService,
     add_common_args,
+    ano_mes_por_vencimento,
     build_common_dirs,
+    buscar_pdf_existente,
     carregar_env_arquivo,
     coleta_data_hora_gmt_menos3,
-    enriquecer_com_extrator,
-    executar_fetch,
-    extrair_cnpj_da_pagina,
-    imprimir_resumo_telefones,
     normalize_document,
+    referencia_para_yyyymm,
     resolve_mode,
 )
 
 
 # ---------------------------------------------------------------------------
-# Config Móvel
+# Config
 # ---------------------------------------------------------------------------
 
 @dataclass
 class MovelConfig(BaseConfig):
-    start_div_index: int = 2
-    max_sections: int = 12
-    max_div_index: int = 20
+    limite: int | None = 2
+    force: bool = False
 
     @property
     def debug_dir(self) -> Path:
         stamp = self.coleta_dt.strftime("%Y%m%d_%H%M%S")
-        return self.output_dir / f"debug_xpath_loop_{stamp}"
+        return self.output_dir / f"debug_movel_{stamp}"
 
 
 # ---------------------------------------------------------------------------
-# Helpers de extração de dados de linha DOM
+# Coleta de metadados das seções Móvel
 # ---------------------------------------------------------------------------
 
-def montar_xpaths(section_idx: int, div_idx: int) -> tuple[str, str, str]:
-    section_xpath = (
-        f"/html/body/main/div/div/div/div/div[2]/div[2]/div/div[1]/section[{section_idx}]"
-    )
-    row_xpath = f"{section_xpath}/div/div[{div_idx}]"
-    button_xpath = f"{row_xpath}/div[4]/div/div/div[2]/div/button"
-    link_xpath = f"{row_xpath}/div[4]/div/div/div[2]/div/div/ul/li[1]/a"
-    return row_xpath, button_xpath, link_xpath
+def _extrair_secoes_movel(page: Any, config: MovelConfig, logger: Logger) -> list[dict[str, Any]]:
+    """Coleta metadados de todas as seções/contas da grade Vivo Móvel.
 
+    Estrutura confirmada via HTML:
+      section[data-test-invoices-line-grid]
+        h4[aria-label^="Conta:"]                                           → número da conta
+        .data-card-section__secondColumn .data-card-cell__description     → valor
+        .data-card-section__thirdColumn  .data-card-cell__description     → vencimento
+        .badge p                                                           → situacao
+    """
+    secoes: list[dict[str, Any]] = []
 
-def _extrair_dados_row(row: Any) -> tuple[str, str, str]:
-    """Extrai (vencimento, valor, situacao) de uma linha DOM da grade Móvel."""
-    vencimento = ""
-    valor = ""
-    situacao = ""
     try:
-        due = row.locator(".data-card-section__thirdColumn p.data-card-cell__description").first
-        if due.count() > 0:
-            due_text = due.inner_text(timeout=1500)
-            due_match = re.search(r"(\d{2}/\d{2}/\d{4})", due_text)
-            vencimento = due_match.group(1) if due_match else ""
+        page.locator("[data-test-invoices-line-grid]").first.wait_for(state="visible", timeout=15000)
     except Exception:
-        pass
-    try:
-        value_node = row.locator(
-            ".data-card-section__secondColumn p.data-card-cell__description"
-        ).first
-        if value_node.count() > 0:
-            valor = value_node.inner_text(timeout=1500).replace("\xa0", " ").strip()
-    except Exception:
-        pass
-    try:
-        status_node = row.locator(".badge p").first
-        if status_node.count() > 0:
-            situacao = status_node.inner_text(timeout=1500).strip()
-    except Exception:
-        pass
-    return vencimento, valor, situacao
+        logger.log("warn", "Grid data-test-invoices-line-grid nao encontrado")
+
+    sections = page.locator("section[data-test-invoices-line-grid]").all()
+    logger.log("info", f"Secoes encontradas: {len(sections)}")
+
+    for sec in sections:
+        codigo_cliente = ""
+        try:
+            el = sec.locator("h4[aria-label^='Conta:']").first
+            if el.count() > 0:
+                texto = el.inner_text(timeout=1500).strip()
+                m = re.search(r"Conta:\s*(\S+)", texto)
+                codigo_cliente = m.group(1) if m else texto
+        except Exception:
+            pass
+
+        valor = ""
+        try:
+            el = sec.locator(".data-card-section__secondColumn .data-card-cell__description").first
+            if el.count() > 0:
+                valor = el.inner_text(timeout=1500).replace("\xa0", " ").strip()
+        except Exception:
+            pass
+
+        vencimento = ""
+        try:
+            el = sec.locator(".data-card-section__thirdColumn .data-card-cell__description").first
+            if el.count() > 0:
+                vencimento = el.inner_text(timeout=1500).strip()
+        except Exception:
+            pass
+
+        situacao = ""
+        try:
+            el = sec.locator(".badge p").first
+            if el.count() > 0:
+                situacao = el.inner_text(timeout=1500).strip()
+        except Exception:
+            pass
+
+        ano, mes = ano_mes_por_vencimento(vencimento)
+        referencia_yyyymm = f"{ano}{mes}" if ano != "0000" else referencia_para_yyyymm(vencimento)
+
+        secoes.append({
+            "codigo_cliente": codigo_cliente,
+            "valor": valor,
+            "vencimento": vencimento,
+            "referencia": referencia_yyyymm,
+            "situacao": situacao,
+            "faturas": [{"valor": valor, "referencia": referencia_yyyymm, "situacao": situacao}],
+            "_sec_locator": sec,
+        })
+
+    return secoes
 
 
 # ---------------------------------------------------------------------------
-# InvoiceService
+# MovelDownloadService
 # ---------------------------------------------------------------------------
 
-class InvoiceCollectionStrategy(Protocol):
-    def collect(self, page: Any, config: MovelConfig) -> list[dict[str, Any]]: ...
-
-
-class XPathInvoiceCollectionStrategy:
+class MovelDownloadService:
     def __init__(self, logger: Logger) -> None:
         self.logger = logger
+        self.panel = DownloadPanelService(logger)
 
-    def collect(self, page: Any, config: MovelConfig) -> list[dict[str, Any]]:
-        faturas: list[dict[str, Any]] = []
-        for section_idx in range(1, config.max_sections + 1):
-            section_xpath = (
-                f"/html/body/main/div/div/div/div/div[2]/div[2]/div/div[1]/section[{section_idx}]"
-            )
-            section_locator = page.locator(f"xpath={section_xpath}").first
-            if section_locator.count() == 0:
-                if section_idx == 1:
-                    continue
-                break
-            conta = self._extrair_conta_secao(page, section_xpath)
-            for div_idx in range(config.start_div_index, config.max_div_index + 1):
-                item = self._coletar_item_secao(page, config, section_idx, div_idx, conta)
-                if item is None:
-                    if self._fim_da_secao(page, section_idx, div_idx, config):
-                        break
-                    continue
-                faturas.append(item)
-                self.logger.log(
-                    "info", "Fatura encontrada",
-                    conta=item.get("conta", ""),
-                    vencimento=item.get("vencimento", ""),
-                    valor=item.get("valor", ""),
-                    situacao=item.get("situacao", ""),
+    def _clicar_exibir_detalhes(self, page: Any, sec_locator: Any) -> bool:
+        for seletor in [
+            "[data-test-detail-button] button",
+            "button[aria-label*='Exibir detalhes']",
+            "button:has-text('Exibir detalhes')",
+        ]:
+            btn = sec_locator.locator(seletor).first
+            if btn.count() == 0:
+                continue
+            try:
+                btn.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            texto = ""
+            try:
+                texto = btn.inner_text(timeout=1000)
+            except Exception:
+                pass
+            self.logger.log("info", "Clicando Exibir detalhes", texto=texto.strip())
+            if not BrowserActions.click_with_fallback(btn, timeout_ms=5000):
+                continue
+            try:
+                page.locator("[data-test-open-dropdown-button]").first.wait_for(
+                    state="visible", timeout=8000
                 )
-        return faturas
-
-    def _extrair_conta_secao(self, page: Any, section_xpath: str) -> str:
-        try:
-            title = page.locator(f"xpath={section_xpath}//h4[contains(@aria-label,'Conta')]").first
-            if title.count() == 0:
-                return ""
-            text = title.inner_text(timeout=1500)
-            match = re.search(r"(\d{8,})", text)
-            return match.group(1) if match else ""
-        except Exception:
-            return ""
-
-    def _fim_da_secao(self, page: Any, section_idx: int, div_idx: int, config: MovelConfig) -> bool:
-        row_xpath, _, _ = montar_xpaths(section_idx, div_idx)
-        row = page.locator(f"xpath={row_xpath}").first
-        if row.count() == 0 and div_idx == config.start_div_index:
+            except Exception:
+                page.wait_for_timeout(2000)
+            self.logger.log("info", "Slide de detalhes aberto")
             return True
-        return row.count() == 0
+        self.logger.log("warn", "Botao Exibir detalhes nao encontrado")
+        return False
 
-    def _coletar_item_secao(
+    def _fechar_slide(self, page: Any) -> None:
+        try:
+            btn = page.locator("[data-test-slider-close-button]").first
+            if btn.count() > 0:
+                BrowserActions.click_with_fallback(btn, timeout_ms=3000)
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+    def _obter_opcoes_no_slide(self, page: Any) -> list[dict[str, Any]]:
+        """Retorna lista de {toggle, vencimento, row, situacao} do slide aberto.
+
+        Estrutura:
+          [data-slider-root]
+            datacardsection[data-test-card-section-content]
+              p[aria-label="DD/MM/YYYY"]              → vencimento
+              button[data-test-open-dropdown-button]  → "Opções"
+        """
+        slider = page.locator("[data-slider-root]").first
+        if slider.count() == 0:
+            self.logger.log("warn", "Slide nao encontrado")
+            return []
+
+        rows = slider.locator("datacardsection[data-test-card-section-content]").all()
+        self.logger.log("info", "Linhas no slide", total=len(rows))
+        opcoes = []
+        for row in rows:
+            toggle = row.locator("button[data-test-open-dropdown-button]").first
+            if toggle.count() == 0:
+                continue
+            vencimento = ""
+            try:
+                el = row.locator("p[aria-label]").first
+                if el.count() > 0:
+                    val = el.get_attribute("aria-label", timeout=1000) or ""
+                    if re.match(r"\d{2}/\d{2}/\d{4}", val):
+                        vencimento = val
+                    else:
+                        vencimento = el.inner_text(timeout=1000).strip()
+            except Exception:
+                pass
+            situacao = ""
+            try:
+                situacao = row.evaluate("""el => {
+                    let node = el.parentElement;
+                    while (node) {
+                        const badge = node.querySelector('.data-card-badge');
+                        if (badge) {
+                            return badge.getAttribute('aria-label') || badge.innerText.trim();
+                        }
+                        if (node.hasAttribute('data-slider-root')) break;
+                        node = node.parentElement;
+                    }
+                    return '';
+                }""") or ""
+            except Exception:
+                pass
+            opcoes.append({"toggle": toggle, "vencimento": vencimento, "row": row, "situacao": situacao})
+
+        self.logger.log("info", "Opcoes encontradas", total=len(opcoes))
+        return opcoes
+
+    def _recarregar_e_abrir_secao(
+        self, page: Any, config: MovelConfig, codigo_cliente: str
+    ) -> "tuple[Any | None, list[dict[str, Any]]]":
+        self.logger.log("info", "Recarregando pagina para retry", conta=codigo_cliente)
+        try:
+            page.goto(config.invoices_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(config.wait_ms)
+        except Exception as exc:
+            self.logger.log("warn", "Erro ao recarregar", erro=str(exc))
+            return None, []
+
+        sec_locator = None
+        try:
+            for s in page.locator("section[data-test-invoices-line-grid]").all():
+                el = s.locator("h4[aria-label^='Conta:']").first
+                if el.count() > 0 and codigo_cliente in (el.inner_text(timeout=1500) or ""):
+                    sec_locator = s
+                    break
+        except Exception:
+            return None, []
+
+        if not sec_locator:
+            self.logger.log("warn", "Secao nao encontrada apos reload", conta=codigo_cliente)
+            return None, []
+
+        self.panel.minimizar(page)
+        if not self._clicar_exibir_detalhes(page, sec_locator):
+            return None, []
+
+        page.wait_for_timeout(config.wait_ms // 2)
+        return sec_locator, self._obter_opcoes_no_slide(page)
+
+    def _baixar_conta_detalhada(
         self,
         page: Any,
+        toggle: Any,
+        row_locator: Any,
+        codigo_cliente: str,
+        cnpj: str,
+        idx: int,
+        referencia: str,
+        situacao: str,
         config: MovelConfig,
-        section_idx: int,
-        div_idx: int,
-        conta: str,
-    ) -> dict[str, Any] | None:
-        row_xpath, button_xpath, link_xpath = montar_xpaths(section_idx, div_idx)
-        row = page.locator(f"xpath={row_xpath}").first
-        if row.count() == 0:
-            return None
-        button = page.locator(f"xpath={button_xpath}").first
-        if button.count() == 0:
-            return None
-        vencimento, valor, situacao = _extrair_dados_row(row)
+        runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        pdf_existente = buscar_pdf_existente(config.download_dir, "vivo-movel", cnpj, codigo_cliente, referencia)
+        if pdf_existente and not config.force:
+            self.logger.log("info", "PDF ja existe, pulando download", arquivo=pdf_existente.name)
+            runtime["downloads_ok"] = int(runtime.get("downloads_ok", 0)) + 1
+            return self._resultado(codigo_cliente, referencia, situacao, True, str(pdf_existente), "", config)
+
+        self.panel.minimizar(page)
+        try:
+            toggle.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        if not BrowserActions.click_with_fallback(toggle, timeout_ms=5000):
+            return self._resultado_falha(codigo_cliente, referencia, situacao, config, "Falha ao abrir dropdown")
+        page.wait_for_timeout(600)
+
+        btn_detalhe = None
+        try:
+            dropdown_root = row_locator.locator("[data-test-dropdown-root]").first
+            for seletor in [
+                "a[data-test-dropdown-list-item-link]:has-text('Conta detalhada')",
+                "a[data-test-dropdown-list-item-link]:has-text('nota fiscal')",
+                "[data-test-dropdown-list-item]:nth-child(2) a",
+            ]:
+                el = dropdown_root.locator(seletor).first
+                if el.count() > 0:
+                    self.logger.log("info", "Opcao encontrada", texto=el.inner_text(timeout=1000).strip())
+                    btn_detalhe = el
+                    break
+        except Exception as exc:
+            self.logger.log("warn", "Erro ao buscar opcao", erro=str(exc))
+
+        if btn_detalhe is None:
+            return self._resultado_falha(codigo_cliente, referencia, situacao, config, "Botao Conta detalhada nao encontrado")
+
+        self.logger.log("info", "Solicitando Conta detalhada e NF (.pdf)", linha=idx)
+        tmp, erro = self.panel.aguardar_download(page, btn_detalhe, label=f"{codigo_cliente}/{referencia}")
+
+        if not tmp or erro:
+            runtime["downloads_falhos"] = int(runtime.get("downloads_falhos", 0)) + 1
+            return self._resultado_falha(codigo_cliente, referencia, situacao, config, erro or "Download nao capturado")
+
+        cnpj_s = normalize_document(cnpj) or "semcnpj"
+        cod_s = re.sub(r"\D", "", codigo_cliente) or "semconta"
+        ref_s = referencia if referencia else f"linha{idx:02d}"
+        target = config.download_dir / f"vivo-movel-{cnpj_s}-{cod_s}-{ref_s}.pdf"
+        target.write_bytes(tmp.read_bytes())
+        runtime["downloads_ok"] = int(runtime.get("downloads_ok", 0)) + 1
+        self.logger.log("ok", "PDF salvo", arquivo=target.name)
+        return self._resultado(codigo_cliente, referencia, situacao, True, str(target.resolve()), "", config)
+
+    def _resultado(
+        self,
+        codigo_cliente: str,
+        referencia: str,
+        situacao: str,
+        ok: bool,
+        arquivo: str,
+        erro: str,
+        config: MovelConfig,
+    ) -> dict[str, Any]:
         return {
-            "_xpath_botao": button_xpath,
-            "_xpath_link": link_xpath,
-            "conta": conta,
-            "vencimento": vencimento,
-            "valor": valor,
+            "codigo_cliente": codigo_cliente,
+            "referencia": referencia,
             "situacao": situacao,
-            "download_ok": False,
-            "arquivo_download": "",
-            "erro_download": "",
-            "codigo_de_barras": "",
-            "codigo_de_barras_sem_espaco": "",
+            "download_ok": ok,
+            "arquivo_download": arquivo,
+            "erro_download": erro,
             "coleta_data_hora": config.coleta_data_hora,
         }
 
+    def _resultado_falha(
+        self, codigo_cliente: str, referencia: str, situacao: str, config: MovelConfig, erro: str
+    ) -> dict[str, Any]:
+        return self._resultado(codigo_cliente, referencia, situacao, False, "", erro, config)
 
-class InvoiceService:
-    def __init__(self, logger: Logger) -> None:
-        self.logger = logger
-        self.strategies: list[InvoiceCollectionStrategy] = [
-            XPathInvoiceCollectionStrategy(logger)
-        ]
-
-    def abrir_faturas(self, page: Any, config: MovelConfig, runtime: dict[str, Any]) -> bool:
-        try:
-            page.goto(config.invoices_url, wait_until="domcontentloaded")
-            runtime["faturas_aberto"] = "/sec/invoices" in (page.url or "")
-            page.wait_for_timeout(config.wait_ms)
-        except Exception:
-            runtime["faturas_aberto"] = False
-            self.logger.log("erro", "Falha ao abrir pagina de faturas")
-            return False
-        self.logger.log("ok", "Pagina de faturas aberta", url=page.url)
-        cnpj_pagina = extrair_cnpj_da_pagina(page.content())
-        if cnpj_pagina:
-            runtime["cnpj_cliente"] = cnpj_pagina
-            self.logger.log("ok", "CNPJ extraido da pagina", cnpj=cnpj_pagina)
-        return True
-
-    def coletar_faturas(self, page: Any, config: MovelConfig) -> list[dict[str, Any]]:
-        agregadas: list[dict[str, Any]] = []
-        vistos: set[tuple[str, str, str, str]] = set()
-        for strategy in self.strategies:
-            for item in strategy.collect(page, config):
-                chave = (
-                    str(item.get("conta", "")),
-                    str(item.get("vencimento", "")),
-                    str(item.get("valor", "")),
-                    str(item.get("situacao", "")),
+    def _retry_opcao(
+        self, page: Any, config: MovelConfig, runtime: dict[str, Any],
+        cnpj: str, codigo_cliente: str, referencia: str, situacao: str, idx: int,
+    ) -> "dict[str, Any] | None":
+        _, opcoes = self._recarregar_e_abrir_secao(page, config, codigo_cliente)
+        if not opcoes:
+            return None
+        for o in opcoes:
+            v = o["vencimento"]
+            a, m = ano_mes_por_vencimento(v)
+            ref = f"{a}{m}" if a != "0000" else referencia_para_yyyymm(v)
+            if ref == referencia:
+                return self._baixar_conta_detalhada(
+                    page, o["toggle"], o["row"], codigo_cliente, cnpj,
+                    idx, referencia, o.get("situacao", situacao), config, runtime,
                 )
-                if chave not in vistos:
-                    vistos.add(chave)
-                    agregadas.append(item)
-        return agregadas
+        self.logger.log("warn", "Opcao nao encontrada apos reload", referencia=referencia)
+        return None
 
+    def _processar_com_retry(
+        self, page: Any, toggle: Any, row: Any,
+        codigo_cliente: str, cnpj: str, idx: int,
+        referencia: str, situacao: str, config: MovelConfig, runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        resultado = self._baixar_conta_detalhada(
+            page, toggle, row, codigo_cliente, cnpj, idx, referencia, situacao, config, runtime
+        )
+        for tentativa in range(1, 4):
+            if resultado["download_ok"]:
+                break
+            self.logger.log("warn", f"Retry {tentativa}/3", referencia=referencia, conta=codigo_cliente)
+            r = self._retry_opcao(page, config, runtime, cnpj, codigo_cliente, referencia, situacao, idx)
+            if r is not None:
+                resultado = r
+            else:
+                break
+        return resultado
 
-# ---------------------------------------------------------------------------
-# DownloadService Móvel
-# ---------------------------------------------------------------------------
-
-class DownloadService:
-    def __init__(self, logger: Logger, naming: NamingService) -> None:
-        self.logger = logger
-        self.naming = naming
-
-    def baixar_faturas(
+    def baixar_todos(
         self,
         page: Any,
-        faturas: list[dict[str, Any]],
+        secoes: list[dict[str, Any]],
         config: MovelConfig,
         runtime: dict[str, Any],
-    ) -> None:
-        if config.listar:
-            self.logger.log("info", "Modo listar ativo, download desabilitado")
-            return
-        for item in faturas:
-            self._baixar_item(page, item, config, runtime)
+    ) -> list[dict[str, Any]]:
+        resultados: list[dict[str, Any]] = []
+        cnpj = str(runtime.get("cnpj_cliente", "") or config.cnpj_inicial or "semcnpj")
+
+        for sec in secoes:
+            sec_locator = sec["_sec_locator"]
+            codigo_cliente = sec.get("codigo_cliente", "")
+            self.panel.minimizar(page)
+
+            if not self._clicar_exibir_detalhes(page, sec_locator):
+                resultados.append(self._resultado_falha(codigo_cliente, "", "", config, "Falha ao expandir Exibir detalhes"))
+                continue
+
+            page.wait_for_timeout(config.wait_ms // 2)
+            opcoes = self._obter_opcoes_no_slide(page)
+
+            if config.listar:
+                for idx, opcao in enumerate(opcoes, start=1):
+                    vencimento = opcao["vencimento"]
+                    situacao = opcao.get("situacao", "")
+                    ano, mes = ano_mes_por_vencimento(vencimento)
+                    referencia = f"{ano}{mes}" if ano != "0000" else referencia_para_yyyymm(vencimento)
+                    pdf_existente = buscar_pdf_existente(config.download_dir, "vivo-movel", cnpj, codigo_cliente, referencia)
+                    if not pdf_existente or config.force:
+                        runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
+                        resultados.append(self._processar_com_retry(
+                            page, opcao["toggle"], opcao["row"],
+                            codigo_cliente, cnpj, idx, referencia, situacao, config, runtime,
+                        ))
+                    else:
+                        resultados.append(self._resultado(
+                            codigo_cliente, referencia, situacao, False, "", "", config
+                        ))
+                self._fechar_slide(page)
+                continue
+
+            limite = config.limite
+            opcoes_para_baixar = opcoes if limite is None else opcoes[:limite]
+            self.logger.log("info", "Faturas para download",
+                total_disponiveis=len(opcoes), baixando=len(opcoes_para_baixar), conta=codigo_cliente)
+
+            if not opcoes:
+                resultados.append(self._resultado_falha(codigo_cliente, "", "", config, "Nenhum toggle encontrado no slide"))
+                self._fechar_slide(page)
+                continue
+
+            for idx, opcao in enumerate(opcoes_para_baixar, start=1):
+                vencimento = opcao["vencimento"]
+                situacao = opcao.get("situacao", "")
+                ano, mes = ano_mes_por_vencimento(vencimento)
+                referencia = f"{ano}{mes}" if ano != "0000" else referencia_para_yyyymm(vencimento)
+                runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
+                resultados.append(self._processar_com_retry(
+                    page, opcao["toggle"], opcao["row"],
+                    codigo_cliente, cnpj, idx, referencia, situacao, config, runtime,
+                ))
+                page.wait_for_timeout(500)
+
+            self._fechar_slide(page)
             page.wait_for_timeout(500)
 
-    def _baixar_item(
-        self,
-        page: Any,
-        item: dict[str, Any],
-        config: MovelConfig,
-        runtime: dict[str, Any],
-    ) -> None:
-        runtime["tentativas_xpath"] = int(runtime["tentativas_xpath"]) + 1
-        button_xpath = str(item.get("_xpath_botao", ""))
-        link_xpath = str(item.get("_xpath_link", ""))
-        try:
-            self._fechar_toggle_dialog(page, runtime)
-            self._clicar_botao_download(page, button_xpath)
-            link = self._obter_link_download(page, link_xpath)
-            target = self._executar_download(page, link, item, config, runtime)
-            item["download_ok"] = True
-            item["arquivo_download"] = str(target.resolve())
-            runtime["downloads_ok"] = int(runtime["downloads_ok"]) + 1
-            self.logger.log("ok", "Download concluido", arquivo=target.name)
-        except Exception as exc:
-            item["erro_download"] = str(exc)
-            runtime["downloads_falhos"] = int(runtime["downloads_falhos"]) + 1
-            self.logger.log("warn", "Falha no download", erro=str(exc), conta=item.get("conta", ""))
+        if config.listar:
+            self.logger.log("info", "Listagem concluida", total=len(resultados))
 
-    def _fechar_toggle_dialog(self, page: Any, runtime: dict[str, Any]) -> None:
-        opened_toggle = page.locator("div.toggle-dialog.dialog-icon.opened").first
-        if opened_toggle.count() > 0 and BrowserActions.click_with_fallback(
-            opened_toggle, timeout_ms=3000
-        ):
-            runtime["cliques_toggle_dialog_aberto"] = (
-                int(runtime["cliques_toggle_dialog_aberto"]) + 1
-            )
-            page.wait_for_timeout(250)
-
-    def _clicar_botao_download(self, page: Any, button_xpath: str) -> None:
-        button = page.locator(f"xpath={button_xpath}").first
-        if button.count() == 0:
-            raise RuntimeError("Botao nao encontrado")
-        try:
-            button.scroll_into_view_if_needed(timeout=3000)
-        except Exception:
-            pass
-        if not BrowserActions.click_with_fallback(button, timeout_ms=5000):
-            raise RuntimeError("Falha ao clicar no botao")
-        page.wait_for_timeout(300)
-
-    def _obter_link_download(self, page: Any, link_xpath: str) -> Any:
-        link = page.locator(f"xpath={link_xpath}").first
-        if link.count() == 0:
-            raise RuntimeError("Link de download nao encontrado")
-        return link
-
-    def _executar_download(
-        self,
-        page: Any,
-        link: Any,
-        item: dict[str, Any],
-        config: MovelConfig,
-        runtime: dict[str, Any],
-    ) -> Path:
-        with page.expect_download(timeout=45000) as dl_info:
-            if not BrowserActions.click_with_fallback(link, timeout_ms=5000):
-                raise RuntimeError("Falha ao clicar no link de download")
-        download = dl_info.value
-        target = self.naming.montar_nome_arquivo_padrao(
-            str(runtime.get("cnpj_cliente", "") or config.cnpj_inicial),
-            str(item.get("conta", "")),
-            str(item.get("vencimento", "")),
-            config.download_dir,
-        )
-        download.save_as(str(target))
-        return target
+        return resultados
 
 
 # ---------------------------------------------------------------------------
-# Normalização de faturas Móvel para saída
+# App
 # ---------------------------------------------------------------------------
 
-def normalizar_faturas_saida(faturas: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    resultado: list[dict[str, Any]] = []
-    for item in faturas:
-        item_final = {
-            "conta": item.get("conta", ""),
-            "vencimento": item.get("vencimento", ""),
-            "valor": item.get("valor", ""),
-            "situacao": item.get("situacao", ""),
-            "download_ok": item.get("download_ok", False),
-            "arquivo_download": item.get("arquivo_download", ""),
-            "erro_download": item.get("erro_download", ""),
-            "codigo_de_barras": item.get("codigo_de_barras", ""),
-            "codigo_de_barras_sem_espaco": item.get("codigo_de_barras_sem_espaco", ""),
-            "pix_copia_cola": "",
-            "emissor": "",
-            "destinatario": "",
-            "identificador_fatura": "",
-            "telefone": "",
-            "data_emissao": "",
-            "data_vencimento": item.get("vencimento", ""),
-            "coleta_data_hora": item.get("coleta_data_hora", ""),
-        }
-        item_final = enriquecer_com_extrator(item_final)
-        resultado.append(item_final)
-    return resultado
+class VivoMovelApp(BaseVivoApp):
+    PREFIXO_RESULTADO = "vivo_movel_resultado"
+    PDF_PREFIXO = "vivo-movel"
+    TITULO_TABELA = "LISTAGEM DE FATURAS VIVO MOVEL"
 
-
-# ---------------------------------------------------------------------------
-# App principal Móvel
-# ---------------------------------------------------------------------------
-
-class VivoMovelApp:
     def __init__(self, config: MovelConfig) -> None:
-        self.config = config
-        self.logger = Logger()
-        self.debug = DebugCollector(config, self.logger)
-        self.auth_service = AuthService(self.logger)
-        self.invoice_service = InvoiceService(self.logger)
-        naming = NamingService()
-        self.download_service = DownloadService(self.logger, naming)
-        self.result_service = ResultService(naming)
-        self.runtime: dict[str, Any] = {
-            "campo_senha_detectado": False,
-            "senha_enviada": False,
-            "dashboard_detectado": False,
-            "faturas_aberto": False,
-            "cliques_toggle_dialog_aberto": 0,
-            "tentativas_xpath": 0,
-            "downloads_ok": 0,
-            "downloads_falhos": 0,
-            "faturas_disponiveis": [],
-            "cnpj_cliente": config.cnpj_inicial,
-            "debug_paginas": 0,
-            "erro_execucao": "",
-        }
+        super().__init__(config)
+        self.download_service = MovelDownloadService(self.logger)
 
-    def run(self) -> Path:
-        response = executar_fetch(self.config, self._page_action, self.runtime)
-        result_file = self.result_service.salvar_resultado(
-            response, self.config, self.runtime,
-            extra={
-                "cliques_toggle_dialog_aberto": self.runtime["cliques_toggle_dialog_aberto"],
-                "tentativas_xpath": self.runtime["tentativas_xpath"],
-            },
-            prefixo="vivo_movel_resultado",
-        )
-        self.logger.log("ok", "Execucao finalizada", status=response.status, url=response.url)
-        self.logger.log("ok", "Resumo", tentativas=self.runtime["tentativas_xpath"])
-        self.logger.log("ok", "Resumo", downloads_ok=self.runtime["downloads_ok"])
-        self.logger.log("ok", "Resumo", downloads_falhos=self.runtime["downloads_falhos"])
-        imprimir_resumo_telefones(self.runtime["faturas_disponiveis"], self.logger)
-        self.logger.log("ok", "Resultado salvo", arquivo=result_file)
-        return result_file
+    def _coletar_secoes(self, page: Any) -> list[dict[str, Any]]:
+        secoes = _extrair_secoes_movel(page, self.config, self.logger)
+        self.logger.log("info", "Secoes movel coletadas", total=len(secoes))
+        return secoes
 
-    def _page_action(self, page: Any) -> Any:
-        self.logger.log("info", "Abertura da pagina inicial", url=self.config.url)
-        page.wait_for_timeout(self.config.wait_ms)
-        self.debug.capture(page, "01_primeira_tela", self.runtime)
+    def _popular_faturas(self, secoes: list[dict[str, Any]]) -> None:
+        for sec in secoes:
+            self.runtime["faturas_disponiveis"].append({
+                "codigo_cliente": sec.get("codigo_cliente", ""),
+                "valor": sec.get("valor", ""),
+                "vencimento": sec.get("vencimento", ""),
+                "referencia": sec.get("referencia", ""),
+                "situacao": sec.get("situacao", ""),
+                "coleta_data_hora": self.config.coleta_data_hora,
+            })
 
-        if not self.auth_service.executar_login(page, self.config, self.runtime):
-            return page
-        self.debug.capture(page, "02_apos_login", self.runtime)
-
-        if not self.invoice_service.abrir_faturas(page, self.config, self.runtime):
-            return page
-        self.debug.capture(page, "03_faturas", self.runtime)
-
-        faturas = self.invoice_service.coletar_faturas(page, self.config)
-        self.download_service.baixar_faturas(page, faturas, self.config, self.runtime)
-        self.runtime["faturas_disponiveis"] = normalizar_faturas_saida(faturas)
-        self.debug.capture(page, "04_final", self.runtime)
-        return page
+    def _baixar_ou_listar(self, page: Any, secoes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self.download_service.baixar_todos(page, secoes, self.config, self.runtime)
 
 
 # ---------------------------------------------------------------------------
@@ -425,12 +496,16 @@ class VivoMovelApp:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download de faturas Vivo Movel via portal Vivo Empresas"
+        description="Download de contas detalhadas Vivo Movel"
     )
     add_common_args(parser)
-    parser.add_argument("--start-div-index", type=int, default=2)
-    parser.add_argument("--max-sections", type=int, default=12)
-    parser.add_argument("--max-div-index", type=int, default=20)
+    parser.set_defaults(mode="headless")
+    parser.add_argument("--limite", type=int, default=2, metavar="N",
+        help="Numero maximo de faturas por conta (default: 2)")
+    parser.add_argument("--todas", action="store_true",
+        help="Baixar todas as faturas (ignora --limite)")
+    parser.add_argument("--force", action="store_true",
+        help="Forca re-download mesmo se o PDF ja existir")
     return parser.parse_args()
 
 
@@ -450,18 +525,15 @@ def build_config(args: argparse.Namespace) -> MovelConfig:
         listar=args.listar,
         mode=resolve_mode(args),
         coleta_dt=coleta_data_hora_gmt_menos3(),
-        start_div_index=args.start_div_index,
-        max_sections=args.max_sections,
-        max_div_index=args.max_div_index,
+        limite=None if getattr(args, "todas", False) else args.limite,
+        force=getattr(args, "force", False),
     )
 
 
 def main() -> None:
     carregar_env_arquivo(Path(".env"))
     args = parse_args()
-    config = build_config(args)
-    app = VivoMovelApp(config)
-    app.run()
+    VivoMovelApp(build_config(args)).run()
 
 
 if __name__ == "__main__":
