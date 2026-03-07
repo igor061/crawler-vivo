@@ -47,7 +47,7 @@ vivo-extrator /caminho/fatura.pdf  # Extrai dados de um PDF
 ## Atualizacao
 
 ```bash
-pip install --upgrade git+https://github.com/igor061/crawler-vivo.git
+pip install --force-reinstall --no-cache-dir git+https://github.com/igor061/crawler-vivo.git
 ```
 
 ---
