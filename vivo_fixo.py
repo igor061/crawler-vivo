@@ -592,7 +592,8 @@ def build_config(args: argparse.Namespace) -> FixoConfig:
 def main() -> None:
     carregar_env_arquivo(Path(".env"))
     args = parse_args()
-    if not validar_credenciais(args.cpf, args.password):
+    args.cpf, args.password = validar_credenciais(args.cpf, args.password)
+    if not args.cpf or not args.password:
         raise SystemExit(1)
     VivoFixoApp(build_config(args)).run()
 

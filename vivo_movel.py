@@ -534,7 +534,8 @@ def build_config(args: argparse.Namespace) -> MovelConfig:
 def main() -> None:
     carregar_env_arquivo(Path(".env"))
     args = parse_args()
-    if not validar_credenciais(args.cpf, args.password):
+    args.cpf, args.password = validar_credenciais(args.cpf, args.password)
+    if not args.cpf or not args.password:
         raise SystemExit(1)
     VivoMovelApp(build_config(args)).run()
 

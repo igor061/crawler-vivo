@@ -34,8 +34,6 @@ vivo-movel --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
 vivo-fixo  --cpf SEU_CPF_OU_CNPJ --password SUA_SENHA
 ```
 
-> Se nenhuma credencial for encontrada, o script imprime instrucoes e encerra sem abrir o browser.
-
 Execute:
 
 ```bash

@@ -5,9 +5,11 @@ Fornece utilitários, serviços e config base usados por vivo_movel.py e vivo_fi
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
+import signal
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -549,18 +551,28 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def validar_credenciais(cpf: str, password: str) -> bool:
-    """Valida se CPF/CNPJ e senha foram informados. Imprime instrucoes se nao."""
-    erros = []
-    if not normalize_document(cpf):
-        erros.append("CPF/CNPJ nao informado (VIVO_CPF)")
-    if not password:
-        erros.append("Senha nao informada (VIVO_PASSWORD)")
-    if not erros:
-        return True
+def _ler_com_timeout(prompt: str, timeout: int, senha: bool = False) -> "str | None":
+    """Lê input do usuario com timeout via SIGALRM (Unix). Retorna None se expirar."""
+    resultado: list[str] = []
 
-    print()
-    print("[erro] Credenciais ausentes: " + " | ".join(erros))
+    def _handler(signum: Any, frame: Any) -> None:
+        raise TimeoutError
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
+    try:
+        valor = getpass.getpass(prompt) if senha else input(prompt)
+        resultado.append(valor)
+    except (TimeoutError, EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+    return resultado[0] if resultado else None
+
+
+def _imprimir_ajuda_credenciais() -> None:
     print()
     print("  Configure de uma das formas a seguir:")
     print()
@@ -576,7 +588,58 @@ def validar_credenciais(cpf: str, password: str) -> bool:
     print("       vivo-movel --cpf seu_cpf_ou_cnpj --password sua_senha")
     print("       vivo-fixo  --cpf seu_cpf_ou_cnpj --password sua_senha")
     print()
-    return False
+
+
+def _salvar_env(cpf: str, password: str) -> None:
+    env_path = Path(".env")
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    lines = [l for l in lines if not l.startswith("VIVO_CPF=") and not l.startswith("VIVO_PASSWORD=")]
+    lines += [f"VIVO_CPF={cpf}", f"VIVO_PASSWORD={password}"]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  [ok] Salvo em {env_path.resolve()}")
+
+
+def validar_credenciais(cpf: str, password: str, timeout: int = 30) -> "tuple[str, str]":
+    """Verifica credenciais; se ausentes, solicita interativamente com timeout de 30s.
+
+    Retorna (cpf, password) prontos para uso, ou ("", "") se nao fornecidos.
+    """
+    faltando = []
+    if not normalize_document(cpf):
+        faltando.append("CPF/CNPJ")
+    if not password:
+        faltando.append("senha")
+
+    if not faltando:
+        return cpf, password
+
+    print()
+    print(f"[info] Credencial(is) ausente(s): {', '.join(faltando)}")
+    print(f"[info] Voce tem {timeout}s para preencher cada campo. Ctrl+C para cancelar.")
+    print()
+
+    if not normalize_document(cpf):
+        val = _ler_com_timeout("  CPF ou CNPJ (somente numeros): ", timeout=timeout)
+        if not val or not normalize_document(val):
+            print("\n[erro] Timeout ou valor invalido.")
+            _imprimir_ajuda_credenciais()
+            return "", ""
+        cpf = val.strip()
+
+    if not password:
+        val = _ler_com_timeout("  Senha: ", timeout=timeout, senha=True)
+        if not val:
+            print("\n[erro] Timeout ou senha em branco.")
+            _imprimir_ajuda_credenciais()
+            return "", ""
+        password = val
+
+    print()
+    salvar = _ler_com_timeout("  Salvar em .env para proximas execucoes? [s/N]: ", timeout=timeout)
+    if salvar and salvar.strip().lower() in ("s", "sim", "y", "yes"):
+        _salvar_env(cpf, password)
+
+    return cpf, password
 
 
 def build_common_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
