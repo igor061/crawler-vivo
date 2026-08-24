@@ -20,3 +20,8 @@ faturas_dados*.json
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# artefatos de build (pip install -e .)
+*.egg-info/
+build/
+dist/
