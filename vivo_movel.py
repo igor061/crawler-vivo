@@ -408,22 +408,15 @@ class MovelDownloadService:
             opcoes = self._obter_opcoes_no_slide(page)
 
             if config.listar:
-                for idx, opcao in enumerate(opcoes, start=1):
+                # --listar nunca baixa: so coleta os metadados do slide.
+                for opcao in opcoes:
                     vencimento = opcao["vencimento"]
                     situacao = opcao.get("situacao", "")
                     ano, mes = ano_mes_por_vencimento(vencimento)
                     referencia = f"{ano}{mes}" if ano != "0000" else referencia_para_yyyymm(vencimento)
-                    pdf_existente = buscar_pdf_existente(config.download_dir, "vivo-movel", cnpj, codigo_cliente, referencia)
-                    if not pdf_existente or config.force:
-                        runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
-                        resultados.append(self._processar_com_retry(
-                            page, opcao["toggle"], opcao["row"],
-                            codigo_cliente, cnpj, idx, referencia, situacao, config, runtime,
-                        ))
-                    else:
-                        resultados.append(self._resultado(
-                            codigo_cliente, referencia, situacao, False, "", "", config
-                        ))
+                    resultados.append(self._resultado(
+                        codigo_cliente, referencia, situacao, False, "", "", config
+                    ))
                 self._fechar_slide(page)
                 continue
 
