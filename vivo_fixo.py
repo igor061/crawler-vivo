@@ -13,25 +13,25 @@ from pathlib import Path
 from typing import Any
 
 from vivo_core import (
-    DEFAULT_DASHBOARD_URL,
-    DEFAULT_INVOICES_URL,
-    DEFAULT_URL,
     BaseConfig,
     BaseVivoApp,
     BrowserActions,
     DownloadPanelService,
     Logger,
     add_common_args,
+    ano_mes_por_vencimento,
     build_common_dirs,
     buscar_pdf_existente,
     carregar_env_arquivo,
     coleta_data_hora_gmt_menos3,
     normalize_document,
     referencia_para_yyyymm,
+    resolve_engine,
     resolve_mode,
+    resolve_spike_login,
+    resolve_warmup_ms,
     validar_credenciais,
 )
-
 
 # ---------------------------------------------------------------------------
 # Config Fixo
@@ -213,14 +213,15 @@ class FixoDownloadService:
             situacao = ""
             try:
                 result = dd.evaluate("""el => {
-                    const dateRe = /^[A-Za-z\u00C0-\u017F]{3}\/\d{4}$/;
+                    const monthRe = /^[A-Za-z\u00C0-\u017F]{3}\/\d{4}$/;
+                    const dateRe = /^\d{2}\/\d{2}\/\d{4}$/;
                     let referencia = '';
+                    let vencimento = '';
                     let situacao = '';
                     let node = el;
                     for (let depth = 0; depth < 12; depth++) {
                         node = node.parentElement;
                         if (!node || node.tagName === 'BODY') break;
-                        // Detecta situacao pelo container de secao
                         const cls = node.className || '';
                         if (!situacao) {
                             if (cls.includes('paid-grid-row') || cls.includes('invoice-paid'))
@@ -230,22 +231,23 @@ class FixoDownloadService:
                             else if (cls.includes('overdue-grid-row') || cls.includes('invoice-overdue'))
                                 situacao = 'Vencida';
                         }
-                        // Detecta referencia em siblings
                         if (!referencia) {
                             for (const child of node.children) {
                                 if (child.contains(el)) continue;
                                 const t = (child.textContent || '').trim();
-                                if (dateRe.test(t)) { referencia = t; break; }
+                                if (monthRe.test(t)) { referencia = t; break; }
+                                if (!vencimento && dateRe.test(t)) { vencimento = t; }
                                 for (const gc of child.children) {
                                     const gt = (gc.textContent || '').trim();
-                                    if (dateRe.test(gt)) { referencia = gt; break; }
+                                    if (monthRe.test(gt)) { referencia = gt; break; }
+                                    if (!vencimento && dateRe.test(gt)) { vencimento = gt; }
                                 }
                                 if (referencia) break;
                             }
                         }
                         if (referencia && situacao) break;
                     }
-                    return { referencia, situacao };
+                    return { referencia: referencia || vencimento, situacao };
                 }""") or {}
                 referencia = result.get("referencia", "") if isinstance(result, dict) else ""
                 situacao = result.get("situacao", "") if isinstance(result, dict) else ""
@@ -311,6 +313,10 @@ class FixoDownloadService:
     ) -> dict[str, Any]:
         # Verifica se PDF já existe
         ref_yyyymm = referencia_para_yyyymm(referencia) if referencia else ""
+        if not ref_yyyymm and referencia:
+            ano, mes = ano_mes_por_vencimento(referencia)
+            if ano != "0000":
+                ref_yyyymm = f"{ano}{mes}"
         pdf_existente = buscar_pdf_existente(config.download_dir, "vivo-fixo", cnpj, codigo_cliente, ref_yyyymm) if ref_yyyymm else None
         if pdf_existente and not config.force:
             self.logger.log("info", "PDF ja existe, pulando download", arquivo=pdf_existente.name)
@@ -586,6 +592,9 @@ def build_config(args: argparse.Namespace) -> FixoConfig:
         coleta_dt=coleta_data_hora_gmt_menos3(),
         limite=limite,
         force=getattr(args, "force", False),
+        engine=resolve_engine(args),
+        spike_login=resolve_spike_login(args),
+        warmup_ms=resolve_warmup_ms(args),
     )
 
 

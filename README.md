@@ -50,6 +50,88 @@ vivo-extrator /caminho/fatura.pdf  # Extrai dados de um PDF
 pip install --force-reinstall --no-cache-dir git+https://github.com/igor061/crawler-vivo.git
 ```
 
+## Servidor Linux headless (VPS) — instavel
+
+**Recomendado rodar em desktop (macOS/Linux com GPU real), onde o login e 100% estavel.**
+
+Em servidor sem GPU o Firefox fica **sem WebGL** e o antifraude da Vivo rejeita o login
+com um falso "A senha nao esta correta" (mesmo com a senha certa). Dependencias extras
+obrigatorias nesse cenario — Mesa (WebGL por software) e Xvfb:
+
+```bash
+sudo apt-get install -y libgl1 libegl1 libgl1-mesa-dri mesa-utils xvfb
+```
+
+E execute sempre com display virtual (headless puro continua sem WebGL):
+
+```bash
+vivo-movel --mode virtual
+vivo-fixo  --mode virtual
+```
+
+Mesmo assim o login em VPS **falhava na maioria das tentativas** (testado em Contabo). O motivo
+era o **shape do fingerprint**: um browser Linux atrás de proxy residencial é uma contradição que
+o antifraude usa para reprovar. A partir do Camoufox 0.5.x (Firefox >= 149) dá para usar os
+**fingerprint presets reais** (macOS/Windows/Linux) com `VIVO_CAMOUFOX_OS=macos` + `VIVO_CAMOUFOX_PRESET=51`
+(pin do preset macOS Apple M1), o que faz o VPS logar com um fingerprint macOS coerente:
+
+```bash
+VIVO_PROXY=http://10.202.0.3:8888 \
+VIVO_CAMOUFOX_OS=macos VIVO_CAMOUFOX_PRESET=51 \
+vivo-movel --engine camoufox --mode virtual
+```
+
+Confira `VIVO_CAMOUFOX_PRESET`: `off` desliga; `on`/`random` sorteia preset (pode crashar com
+"No WebGL data found"); um número fixa o preset macOS v150 daquele índice (51 = Apple M1, seguro).
+
+O antifraude ainda pontua a reputação do IP por janela: a 1ª tentativa após ~5min de cooldown
+passa, e tentativas em rajada levam falso "OAM-2". Isso não trava a conta. `VIVO_LOGIN_RETRIES`
+(default 3) + `VIVO_LOGIN_RETRY_BACKOFF` (default 60s) re-tentam com nova sessão até o dashboard
+confirmar. Para uso diário (1 login/dia) o fluxo VPS funciona.
+
+Cuidado: cada falha consome o contador de tentativas de senha da Vivo ("Voce tem mais 3 tentativas")
+e pode bloquear a conta; um login bem-sucedido zera o contador.
+
+Em Linux o `navigator.mediaDevices.enumerateDevices()` do Camoufox nunca resolve (sem
+hardware de midia), o que trava scripts antifraude. O projeto injeta dispositivos falsos
+automaticamente nesse caso — controlado por `VIVO_FIX_MEDIA_DEVICES`:
+
+| Valor | Efeito |
+|---|---|
+| `auto` (padrao) | aplica o patch so em Linux |
+| `on` | aplica sempre |
+| `off` | desliga o patch |
+
+### Proxy de saida (opcional)
+
+Para sair pela internet de outra maquina (ex.: IP residencial via WireGuard), defina
+`VIVO_PROXY` — o geoip do Camoufox e ativado automaticamente para casar timezone/locale
+com o IP de saida (requer `pip install "camoufox[geoip]"`):
+
+```bash
+VIVO_PROXY=http://10.202.0.3:8888 vivo-movel --mode virtual
+```
+
+`VIVO_CAMOUFOX_OS` (ex.: `macos`) forca o fingerprint de OS do browser, se necessario.
+
+### Engines e warm-up
+
+Selecao de motor de automacao (`--engine` / env `VIVO_ENGINE`):
+
+| Engine | Cloudflare mve.vivo.com.br | Notas |
+|---|---|---|
+| `camoufox` (padrao) | passa | unica engine que atravessa o challenge "Um momento..." |
+| `patchright` | preso | `channel=chrome` nao vence o challenge |
+| `nodriver` | preso | CDP direto, sem shim do Playwright, mas Chrome e bloqueado |
+
+- `--warmup-ms <ms>` (env `VIVO_WARMUP_MS`): antes do login, navega para uma pagina neutra e
+  aguarda o tempo dado, aquecendo o beacon antifraude. Na pratica nao ajudou a destravar o
+  login — manter desligado (0).
+- No VPS, o login passou a funcionar com Camoufox 0.5.x + fingerprint preset macOS real
+  (ver secao "Servidor Linux headless (VPS)"): o problema era o shape Linux + residencial,
+  nao o IP. Retry seguro via `VIVO_LOGIN_RETRIES`/`VIVO_LOGIN_RETRY_BACKOFF`.
+
+
 ---
 
 ## Objetivo do projeto
@@ -117,8 +199,10 @@ vivo-extrator /caminho/para/fatura.pdf --salvar  # salva <nome>_dados.json ao la
 
 - PDFs Movel: `downloads/vivo/vivo-movel-<cnpj>-<conta>-<yyyymm>.pdf`
 - PDFs Fixo: `downloads/vivo/vivo-fixo-<cnpj>-<conta>-<yyyymm>.pdf`
-- JSON resultado: `downloads/vivo/vivo_movel_resultado_<cnpj>_<timestamp>.json`
-- Debug (com `--debug`): `screenshots/scrapling/debug_movel_<timestamp>/`
+- JSON resultado: `downloads/vivo/vivo_movel_resultado_<cnpj>_<timestamp>.json` (ou `vivo_fixo_resultado_...`)
+- Debug (com `--debug`): `screenshots/scrapling/debug_movel_<timestamp>/` ou `debug_fixo_<timestamp>/`
+
+Ao final da execucao, alem da tabela de listagem, e impresso um resumo **FATURAS EM ATRASO** com as faturas de situacao Atrasada/Aberta/Vencida, incluindo vencimento, valor, telefone, codigo de barras e PIX copia e cola (quando disponivel no PDF).
 
 ## Qualidade e testes
 

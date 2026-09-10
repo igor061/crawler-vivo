@@ -87,6 +87,19 @@ class ArrecadacaoBarcodeExtractor(BarcodeExtractor):
             if full.startswith("8"):
                 return f"{a} {b} {c} {d}"
 
+        # Formato "11d 1d 11d 1d 11d 1d 11d 1d" (ex: boletos Fixo)
+        grouped_11_1 = re.compile(
+            r"(?<!\d)(\d{11})\s+(\d)\s+(\d{11})\s+(\d)\s+(\d{11})\s+(\d)\s+(\d{11})\s+(\d)(?!\d)"
+        )
+        for m in grouped_11_1.finditer(text):
+            a = m.group(1) + m.group(2)
+            b = m.group(3) + m.group(4)
+            c = m.group(5) + m.group(6)
+            d = m.group(7) + m.group(8)
+            full = a + b + c + d
+            if full.startswith("8"):
+                return f"{a} {b} {c} {d}"
+
         raw_48 = re.compile(r"(?<!\d)(\d{48})(?!\d)")
         for full in raw_48.findall(text):
             if full.startswith("8"):

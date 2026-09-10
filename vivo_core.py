@@ -5,18 +5,23 @@ Fornece utilitários, serviços e config base usados por vivo_movel.py e vivo_fi
 """
 
 import argparse
+import asyncio
 import getpass
+import inspect
 import json
 import os
 import re
 import signal
+import sys
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from scrapling.fetchers import StealthyFetcher
-
 
 DEFAULT_URL = "https://mve.vivo.com.br/oauth?logout=true"
 DEFAULT_DASHBOARD_URL = "https://mve.vivo.com.br/sec/dashboard"
@@ -126,6 +131,9 @@ class BaseConfig:
     listar: bool
     mode: str
     coleta_dt: datetime
+    engine: str = "camoufox"
+    spike_login: bool = False
+    warmup_ms: int = 0
 
     @property
     def coleta_data_hora(self) -> str:
@@ -166,10 +174,11 @@ class BrowserActions:
             pass
         try:
             locator.evaluate(
-                """el => {
-                  const ev = new MouseEvent('click', {bubbles: true, cancelable: true, view: window})
-                  el.dispatchEvent(ev)
-                }"""
+                "el => {"
+                "  const ev = new MouseEvent('click', "
+                "    {bubbles: true, cancelable: true, view: window})"
+                "  el.dispatchEvent(ev)"
+                "}"
             )
             return True
         except Exception:
@@ -466,12 +475,154 @@ class _FallbackResponse:
         self.url = url
 
 
-def executar_fetch(
+class _FetchResponse:
+    def __init__(self, url: str, status: int) -> None:
+        self.status = status
+        self.url = url
+
+
+# Em Linux sem hardware de midia o `navigator.mediaDevices.enumerateDevices()` do
+# Camoufox nunca resolve (o browserforge marca `multimediaDevices` como Unsupported).
+# Scripts antifraude que consultam a API travam e classificam a sessao como bot.
+_PATCH_MEDIA_DEVICES = """
+(() => {
+  const fake = [
+    {deviceId: 'default', kind: 'audioinput',  label: '', groupId: 'grp-mic'},
+    {deviceId: 'default', kind: 'audiooutput', label: '', groupId: 'grp-mic'},
+    {deviceId: 'cam0',    kind: 'videoinput',  label: '', groupId: 'grp-cam'},
+  ];
+  const build = () => fake.map(d => {
+    const o = Object.create(window.MediaDeviceInfo ? MediaDeviceInfo.prototype : Object.prototype);
+    Object.defineProperties(o, {
+      deviceId: {value: d.deviceId, enumerable: true},
+      kind: {value: d.kind, enumerable: true},
+      label: {value: d.label, enumerable: true},
+      groupId: {value: d.groupId, enumerable: true},
+      toJSON: {value: () => d},
+    });
+    return o;
+  });
+  const md = navigator.mediaDevices;
+  if (!md) return;
+  const orig = md.enumerateDevices;
+  Object.defineProperty(md, 'enumerateDevices', {
+    configurable: true,
+    writable: true,
+    value: function enumerateDevices() { return Promise.resolve(build()); },
+  });
+  try {
+    Object.defineProperty(md.enumerateDevices, 'toString', {
+      value: () => (orig ? orig.toString()
+                         : 'function enumerateDevices() {\\n    [native code]\\n}'),
+    });
+  } catch (e) {}
+})();
+"""
+
+
+def aplicar_patch_media_devices(page: Any, logger: "Logger | None" = None) -> None:
+    """Instala dispositivos de midia falsos quando rodando em Linux sem hardware.
+
+    O `add_init_script` so vale a partir da proxima navegacao, entao recarrega a
+    pagina para que a pagina de login ja veja a API corrigida.
+    """
+    modo = os.getenv("VIVO_FIX_MEDIA_DEVICES", "auto")
+    if modo == "off":
+        return
+    if modo == "auto" and not sys.platform.startswith("linux"):
+        return
+    try:
+        page.add_init_script(_PATCH_MEDIA_DEVICES)
+        page.reload(wait_until="domcontentloaded")
+        if logger:
+            logger.log("info", "Patch de mediaDevices aplicado")
+    except Exception as exc:
+        if logger:
+            logger.log("warn", "Falha ao aplicar patch de mediaDevices", erro=str(exc))
+
+
+def _resolver_proxy() -> "str | None":
+    return (
+        os.getenv("VIVO_PROXY")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+        or None
+    )
+
+
+def _camoufox_preset_resolvido() -> dict[str, Any] | bool | None:
+    """Resolve fingerprint_preset do Camoufox (presets reais, Firefox >= 149).
+
+    VIVO_CAMOUFOX_PRESET: off desliga; on/random sorteia preset; um numero
+    (ex.: 51) fixa o preset macOS com aquele indice no arquivo v150. Em 'auto'
+    fixa o preset 51 (Apple M1, compativel com a DB WebGL do Camoufox) quando
+    VIVO_CAMOUFOX_OS forcou o OS. 'on/random' pode crashar com presets cujo
+    vendor WebGL nao esta na DB ("No WebGL data found").
+    """
+    valor = (os.getenv("VIVO_CAMOUFOX_PRESET") or "auto").lower()
+    if valor == "off":
+        return None
+    if valor in ("on", "random"):
+        return True
+    if valor == "auto":
+        if not os.getenv("VIVO_CAMOUFOX_OS"):
+            return None
+        valor = "51"
+    try:
+        from camoufox.utils import launch_options  # type: ignore[import-not-found]
+
+        if "fingerprint_preset" not in inspect.signature(launch_options).parameters:
+            return None
+    except Exception:
+        return None
+    if not valor.isdigit():
+        return None
+    try:
+        import json
+
+        import camoufox
+
+        preset_file = Path(camoufox.__file__).parent / "fingerprint-presets-v150.json"
+        if not preset_file.exists():
+            return None
+        data = json.loads(preset_file.read_text(encoding="utf-8"))
+        macos = data.get("presets", {}).get("macos", [])
+        indice = int(valor)
+        if indice < 0 or indice >= len(macos):
+            return None
+        return macos[indice]
+    except Exception:
+        return None
+
+
+def _camoufox_preset_habilitado() -> bool:
+    return _camoufox_preset_resolvido() is not None
+
+
+def _executar_fetch_camoufox(
     config: BaseConfig,
     page_action: Callable[[Any], Any],
     runtime: dict[str, Any],
 ) -> Any:
-    """Executa StealthyFetcher com a page_action fornecida. Retorna o response."""
+    """Executa StealthyFetcher (Camoufox) com a page_action fornecida."""
+    proxy = _resolver_proxy()
+    if proxy:
+        Logger().log("info", "Usando proxy", proxy=proxy)
+    extra: dict[str, Any] = {}
+    os_fingerprint = os.getenv("VIVO_CAMOUFOX_OS")
+    if os_fingerprint:
+        extra["additional_arguments"] = {"os": os_fingerprint}
+        Logger().log("info", "Fingerprint de OS forcado", os=os_fingerprint)
+    preset = _camoufox_preset_resolvido()
+    if preset is not None:
+        extra.setdefault("additional_arguments", {})["fingerprint_preset"] = preset
+        if preset is True:
+            desc = "sorteio"
+        elif isinstance(preset, dict) and preset.get("navigator"):
+            desc = "pin (macos v150)"
+        else:
+            desc = "pin"
+        Logger().log("info", "Fingerprint preset (v150) habilitado", modo=desc)
     try:
         return StealthyFetcher.fetch(
             url=config.url,
@@ -480,11 +631,428 @@ def executar_fetch(
             wait=config.wait_ms,
             page_action=page_action,
             humanize=True,
+            proxy=proxy,
+            geoip=bool(proxy),
+            **extra,
         )
     except Exception as exc:
         runtime["erro_execucao"] = str(exc)
         Logger().log("erro", "Falha na execucao do browser", erro=str(exc))
         return _FallbackResponse(config.url)
+
+
+def _executar_fetch_patchright(
+    config: BaseConfig,
+    page_action: Callable[[Any], Any],
+    runtime: dict[str, Any],
+) -> Any:
+    """Executa o fluxo via Patchright (Playwright com patches) usando Chrome real.
+
+    `channel='chrome'` usa o Google Chrome instalado (TLS/JA3 de navegador real),
+    com fallback para o Chromium do Playwright caso o Chrome nao exista.
+    """
+    try:
+        from patchright.sync_api import sync_playwright
+    except ImportError:
+        runtime["erro_execucao"] = "patchright nao instalado (pip install patchright)"
+        Logger().log("erro", "patchright nao instalado")
+        return _FallbackResponse(config.url)
+
+    proxy = _resolver_proxy()
+    if proxy:
+        Logger().log("info", "Usando proxy", proxy=proxy)
+    headless = resolve_headless(config.mode) is True
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {"headless": headless}
+            try:
+                launch_kwargs["channel"] = "chrome"
+                browser = p.chromium.launch(**launch_kwargs)
+            except Exception:
+                launch_kwargs.pop("channel", None)
+                Logger().log("info", "Chrome nao disponivel, usando Chromium do Playwright")
+                browser = p.chromium.launch(**launch_kwargs)
+            context_kwargs: dict[str, Any] = {"accept_downloads": True, "locale": "pt-BR"}
+            if proxy:
+                context_kwargs["proxy"] = {"server": proxy}
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
+            page.goto(config.url, wait_until="domcontentloaded")
+            page_action(page)
+            url = page.url
+            browser.close()
+            return _FetchResponse(url, 200)
+    except Exception as exc:
+        runtime["erro_execucao"] = str(exc)
+        Logger().log("erro", "Falha na execucao do patchright", erro=str(exc))
+        return _FallbackResponse(config.url)
+
+
+class _AsyncLoop:
+    """Bridge síncrona -> assíncrona para APIs async (nodriver roda em loop próprio)."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._rodar, daemon=True)
+        self.thread.start()
+
+    def _rodar(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def chamar(self, coro: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+
+    def encerrar(self) -> None:
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception:
+            pass
+        self.thread.join(timeout=2)
+
+
+# Playwright `:has-text('X')` -> CSS + filtro por texto, para usar com nodriver.
+_HAS_TEXT_RE = re.compile(
+    r"^(?P<css>.*?):has-text\((?P<quote>['\"])(?P<text>[^'\"]+)(?P=quote)\)(?P<rest>.*)$"
+)
+
+
+class _NdElement:
+    """Envolve um `nodriver.Element` com a API Playwright que o fluxo usa."""
+
+    def __init__(self, bridge: _AsyncLoop, tab: Any, el: Any) -> None:
+        self._bridge = bridge
+        self._tab = tab
+        self._el = el
+
+    def count(self) -> int:
+        return 1 if self._el is not None else 0
+
+    def is_visible(self) -> bool:
+        if self._el is None:
+            return False
+        try:
+            return bool(self._bridge.chamar(self._el.apply("(e) => e.offsetParent !== null")))
+        except Exception:
+            return False
+
+    def is_enabled(self) -> bool:
+        if self._el is None:
+            return False
+        try:
+            return bool(self._bridge.chamar(self._el.apply("(e) => !e.disabled")))
+        except Exception:
+            return False
+
+    def fill(self, value: str) -> None:
+        if self._el is None:
+            raise RuntimeError("Elemento nao encontrado")
+        try:
+            self._bridge.chamar(self._el.send_keys(value))
+        except Exception:
+            self._bridge.chamar(self._el.set_text(value))
+
+    def click(self, timeout: "int | None" = None) -> None:
+        if self._el is None:
+            raise RuntimeError("Elemento nao encontrado")
+        self._bridge.chamar(self._el.click())
+
+    def inner_text(self, timeout: "int | None" = None) -> str:
+        if self._el is None:
+            return ""
+        try:
+            return str(
+                self._bridge.chamar(self._el.apply("(e) => e.innerText || e.textContent || ''"))
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def get_attribute(self, name: str, timeout: "int | None" = None) -> "str | None":
+        if self._el is None:
+            return None
+        try:
+            val = self._bridge.chamar(self._el.apply(f"(e) => e.getAttribute('{name}')"))
+            return str(val) if val is not None else None
+        except Exception:
+            return None
+
+    def evaluate(self, js: str) -> Any:
+        if self._el is None:
+            return None
+        try:
+            return self._bridge.chamar(self._el.apply(js))
+        except Exception:
+            return None
+
+    def scroll_into_view_if_needed(self, timeout: "int | None" = None) -> None:
+        if self._el is None:
+            return
+        try:
+            self._bridge.chamar(self._el.scroll_into_view())
+        except Exception:
+            pass
+
+    def wait_for(self, state: str = "visible", timeout: "int | None" = None) -> None:
+        deadline = time.monotonic() + (timeout or 5000) / 1000
+        while time.monotonic() < deadline:
+            if self.is_visible():
+                return
+            time.sleep(0.3)
+        raise RuntimeError("Elemento nao ficou visivel")
+
+    def locator(self, selector: str) -> "_NdLocator":
+        return _NdLocator(self._bridge, self._tab, selector, parent=self._el)
+
+    def all(self) -> list["_NdElement"]:
+        return self.locator("*")._buscar_wrapped()
+
+
+class _NdLocator:
+    def __init__(
+        self, bridge: _AsyncLoop, tab: Any, selector: str, parent: Any = None
+    ) -> None:
+        self._bridge = bridge
+        self._tab = tab
+        self._selector = selector
+        self._parent = parent
+
+    def _contem_texto(self, el: Any, texto: str) -> bool:
+        try:
+            txt = str(self._bridge.chamar(el.apply("(e) => e.textContent || ''")) or "")
+            return texto.lower() in txt.lower()
+        except Exception:
+            return False
+
+    def _query_css(self, css: str) -> list[Any]:
+        if not css:
+            return []
+        try:
+            if self._parent is not None:
+                return list(self._bridge.chamar(self._parent.query_selector_all(css)))
+            return list(self._bridge.chamar(self._tab.query_selector_all(css)))
+        except Exception:
+            return []
+
+    def _buscar(self) -> list[Any]:
+        match = _HAS_TEXT_RE.match(self._selector)
+        if not match:
+            return self._query_css(self._selector)
+        css = (match.group("css") or "*").strip()
+        texto = match.group("text")
+        return [el for el in self._query_css(css) if self._contem_texto(el, texto)]
+
+    def _buscar_wrapped(self) -> list[_NdElement]:
+        return [_NdElement(self._bridge, self._tab, el) for el in self._buscar()]
+
+    @property
+    def first(self) -> _NdElement:
+        els = self._buscar()
+        return _NdElement(self._bridge, self._tab, els[0] if els else None)
+
+    def count(self) -> int:
+        return len(self._buscar())
+
+    def all(self) -> list[_NdElement]:
+        return self._buscar_wrapped()
+
+
+class _NdKeyboard:
+    def __init__(self, bridge: _AsyncLoop, tab: Any) -> None:
+        self._bridge = bridge
+        self._tab = tab
+
+    def press(self, key: str) -> None:
+        if key != "Enter":
+            return
+        try:
+            self._bridge.chamar(
+                self._tab.evaluate(
+                    """(() => {
+                        const el = document.activeElement;
+                        if (!el || !el.form) return false;
+                        try {
+                            el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit();
+                            return true;
+                        }
+                        catch (e) { return false; }
+                    })()""",
+                    return_by_value=True,
+                )
+            )
+        except Exception:
+            pass
+
+
+class _NdTabAdapter:
+    """Adapta `nodriver.Tab` para a API Playwright usada por AuthService/BaseVivoApp."""
+
+    def __init__(self, bridge: _AsyncLoop, tab: Any) -> None:
+        self._bridge = bridge
+        self._tab = tab
+        self.keyboard = _NdKeyboard(bridge, tab)
+
+    @property
+    def url(self) -> str:
+        try:
+            return str(
+                self._bridge.chamar(self._tab.evaluate("location.href", return_by_value=True))
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self._bridge.chamar(self._tab.wait(ms / 1000))
+
+    def locator(self, selector: str) -> _NdLocator:
+        return _NdLocator(self._bridge, self._tab, selector)
+
+    def content(self) -> str:
+        try:
+            return str(self._bridge.chamar(self._tab.get_content()) or "")
+        except Exception:
+            return ""
+
+    def screenshot(self, path: "str | None" = None, full_page: bool = False) -> None:
+        try:
+            if path:
+                self._bridge.chamar(self._tab.save_screenshot(filename=path, full_page=full_page))
+            else:
+                self._bridge.chamar(
+                    self._tab.save_screenshot(full_page=full_page, as_base64=True)
+                )
+        except Exception:
+            pass
+
+    def goto(self, url: str, wait_until: "str | None" = None) -> None:
+        self._bridge.chamar(self._tab.get(url))
+
+    def reload(self, wait_until: "str | None" = None) -> None:
+        self._bridge.chamar(self._tab.reload())
+
+    def add_init_script(self, script: str) -> None:
+        return None
+
+    def evaluate(self, expr: str) -> Any:
+        try:
+            return self._bridge.chamar(self._tab.evaluate(expr, return_by_value=True))
+        except Exception:
+            return None
+
+    def wait_for_url(self, glob: str, timeout: int) -> bool:
+        deadline = time.monotonic() + timeout / 1000
+        while time.monotonic() < deadline:
+            if "sec/dashboard" in self.url:
+                return True
+            time.sleep(0.5)
+        raise RuntimeError(f"URL nao atingida em {timeout}ms")
+
+    def on(self, event: str, cb: Callable[..., Any]) -> None:
+        return None
+
+    def remove_listener(self, event: str, cb: Callable[..., Any]) -> None:
+        return None
+
+    def close(self) -> None:
+        try:
+            self._bridge.chamar(self._tab.close())
+        except Exception:
+            pass
+
+
+def _executar_fetch_nodriver(
+    config: BaseConfig,
+    page_action: Callable[[Any], Any],
+    runtime: dict[str, Any],
+) -> Any:
+    """Executa o fluxo via nodriver (Chrome real, CDP direto, sem shim de Playwright).
+
+    Foco do spike: comparar a taxa de sucesso do LOGIN. Downloads nao sao
+    suportados nessa engine — use --spike-login.
+    """
+    try:
+        import nodriver
+    except ImportError:
+        runtime["erro_execucao"] = "nodriver nao instalado (pip install nodriver)"
+        Logger().log("erro", "nodriver nao instalado")
+        return _FallbackResponse(config.url)
+
+    if not config.spike_login:
+        Logger().log(
+            "warn",
+            "Engine nodriver: downloads nao suportados; use --spike-login p/ comparar o login",
+        )
+
+    proxy = _resolver_proxy()
+    if proxy:
+        Logger().log("info", "Usando proxy", proxy=proxy)
+    bridge = _AsyncLoop()
+    browser_args: list[str] = []
+    if proxy:
+        browser_args.append(f"--proxy-server={proxy}")
+
+    try:
+        browser = bridge.chamar(
+            nodriver.start(
+                headless=config.mode == "headless",
+                lang="pt-BR",
+                browser_args=browser_args or None,
+            )
+        )
+        tab = bridge.chamar(browser.get(config.url))
+        page = _NdTabAdapter(bridge, tab)
+        page_action(page)
+        url = page.url
+        try:
+            browser.stop()
+        except Exception:
+            pass
+        return _FetchResponse(url, 200)
+    except Exception as exc:
+        runtime["erro_execucao"] = str(exc)
+        Logger().log("erro", "Falha na execucao do nodriver", erro=str(exc))
+        return _FallbackResponse(config.url)
+    finally:
+        bridge.encerrar()
+
+
+def executar_fetch(
+    config: BaseConfig,
+    page_action: Callable[[Any], Any],
+    runtime: dict[str, Any],
+) -> Any:
+    """Executa o fluxo com a engine selecionada (camoufox|patchright|nodriver).
+
+    Para camoufox, se a senha foi enviada mas o antifraude rejeitou a sessao
+    (falso OAM-2 / dashboard nao detectado), re-tenta com nova sessao/fingerprint
+    (VIVO_LOGIN_RETRIES, default 3; intervalo VIVO_LOGIN_RETRY_BACKOFF, default 300s
+    conforme o cooldown observado do antifraude ~5min).
+    """
+    engine = getattr(config, "engine", "camoufox")
+    if engine == "patchright":
+        return _executar_fetch_patchright(config, page_action, runtime)
+    if engine == "nodriver":
+        return _executar_fetch_nodriver(config, page_action, runtime)
+
+    max_retries = max(0, int(os.getenv("VIVO_LOGIN_RETRIES", "3")))
+    backoff = max(0.0, float(os.getenv("VIVO_LOGIN_RETRY_BACKOFF", "300")))
+    result: Any = None
+    for tentativa in range(max_retries + 1):
+        if tentativa:
+            Logger().log("warn", "Retry de login (nova sessao)", tentativa=tentativa)
+            time.sleep(backoff)
+        result = _executar_fetch_camoufox(config, page_action, runtime)
+        if runtime.get("dashboard_detectado"):
+            return result
+        motivo = "falha de browser" if runtime.get("erro_execucao") else "falso OAM-2"
+        Logger().log(
+            "warn",
+            "Login nao confirmado, re-tentando",
+            tentativa=tentativa,
+            motivo=motivo,
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +1077,49 @@ def imprimir_resumo_telefones(faturas: list[dict[str, Any]], logger: Logger) -> 
         if ref:
             extras["referencia"] = ref
         logger.log("ok", f"  conta={ident}", **extras)
+
+
+def imprimir_resumo_pendentes(
+    faturas: list[dict[str, Any]], titulo: str = "FATURAS EM ATRASO"
+) -> None:
+    """Imprime resumo das faturas com situação Atrasada, Aberta ou Vencida."""
+    pendentes = [
+        f for f in faturas
+        if (f.get("situacao") or "").lower() in ("atrasada", "aberta", "vencida", "pendente")
+    ]
+    if not pendentes:
+        print("\n[ok] Nenhuma fatura em atraso.")
+        return
+
+    print(f"\n{'='*100}")
+    print(f"  {titulo}")
+    print(f"{'='*100}")
+    for f in pendentes:
+        conta = f.get("codigo_cliente") or f.get("identificador_fatura") or "?"
+        ref = f.get("referencia") or "-"
+        sit = f.get("situacao") or "-"
+        venc = f.get("data_vencimento") or f.get("vencimento") or "-"
+        valor = f.get("valor") or "-"
+        tel = f.get("telefone") or "(nao encontrado)"
+        cb = (
+            f.get("codigo_de_barras_sem_espaco")
+            or f.get("codigo_barras_digitavel_sem_espaco")
+            or "-"
+        )
+        pix = f.get("pix_copia_cola") or "-"
+
+        print(f"\n  Conta:      {conta}")
+        print(f"  Referência: {ref}")
+        print(f"  Situação:   {sit}")
+        print(f"  Vencimento: {venc}")
+        print(f"  Valor:      {valor}")
+        print(f"  Telefone:   {tel}")
+        print(f"  Cód.Barras: {cb}")
+        print(f"  PIX:        {pix}")
+        print(f"  {'-'*96}")
+
+    print(f"  Total em atraso: {len(pendentes)} fatura(s)")
+    print(f"{'='*100}")
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +1160,40 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default="headless",
         help="Modo do navegador (Camoufox)",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["camoufox", "patchright", "nodriver"],
+        default=os.getenv("VIVO_ENGINE", "camoufox"),
+        help="Browser/fetcher a usar (default: camoufox)",
+    )
+    parser.add_argument(
+        "--spike-login",
+        action="store_true",
+        help="Para apos validar o login, para comparar engines sem baixar faturas",
+    )
+    parser.add_argument(
+        "--warmup-ms",
+        type=int,
+        default=int(os.getenv("VIVO_WARMUP_MS", "0")),
+        help="Atraso apos carregar a pagina de login antes de preencher CPF/senha "
+        "(warm-up do beacon antifraude, ex.: 20000)",
+    )
+
+
+def resolve_engine(args: argparse.Namespace) -> str:
+    engine = getattr(args, "engine", "") or os.getenv("VIVO_ENGINE", "") or "camoufox"
+    if engine not in ("camoufox", "patchright", "nodriver"):
+        Logger().log("warn", "Engine desconhecida, usando camoufox", engine=engine)
+        return "camoufox"
+    return engine
+
+
+def resolve_spike_login(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "spike_login", False))
+
+
+def resolve_warmup_ms(args: argparse.Namespace) -> int:
+    return max(0, int(getattr(args, "warmup_ms", 0) or 0))
 
 
 def _ler_com_timeout(prompt: str, timeout: int, senha: bool = False) -> "str | None":
@@ -593,7 +1238,11 @@ def _imprimir_ajuda_credenciais() -> None:
 def _salvar_env(cpf: str, password: str) -> None:
     env_path = Path(".env")
     lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    lines = [l for l in lines if not l.startswith("VIVO_CPF=") and not l.startswith("VIVO_PASSWORD=")]
+    lines = [
+        line
+        for line in lines
+        if not line.startswith("VIVO_CPF=") and not line.startswith("VIVO_PASSWORD=")
+    ]
     lines += [f"VIVO_CPF={cpf}", f"VIVO_PASSWORD={password}"]
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"  [ok] Salvo em {env_path.resolve()}")
@@ -619,7 +1268,9 @@ def validar_credenciais(cpf: str, password: str, timeout: int = 30) -> "tuple[st
     print()
 
     if not normalize_document(cpf):
-        val = _ler_com_timeout("  CPF ou CNPJ do Vivo Empresas (somente numeros): ", timeout=timeout)
+        val = _ler_com_timeout(
+            "  CPF ou CNPJ do Vivo Empresas (somente numeros): ", timeout=timeout
+        )
         if not val or not normalize_document(val):
             print("\n[erro] Timeout ou valor invalido.")
             _imprimir_ajuda_credenciais()
@@ -737,11 +1388,33 @@ class BaseVivoApp:
             imprimir_tabela_listagem(
                 self.runtime["faturas_disponiveis"], titulo=self.TITULO_TABELA
             )
+        # Lê o JSON salvo para ter todos os campos enriquecidos (PIX via QR, etc.)
+        try:
+            import json
+            with open(result_file, encoding="utf-8") as fh:
+                resultado_json = json.load(fh)
+            faturas_json = resultado_json.get("faturas_disponiveis", [])
+        except Exception:
+            faturas_json = self.runtime["faturas_disponiveis"]
+        imprimir_resumo_pendentes(
+            faturas_json,
+            titulo=f"FATURAS EM ATRASO — {self.TITULO_TABELA.replace('LISTAGEM DE FATURAS ', '')}",
+        )
         self.logger.log("ok", "Resultado salvo", arquivo=result_file)
         return result_file
 
     def _page_action(self, page: Any) -> Any:
+        aplicar_patch_media_devices(page, self.logger)
         self.logger.log("info", "Pagina inicial", url=self.config.url)
+        warmup = getattr(self.config, "warmup_ms", 0) or 0
+        if warmup > 0:
+            self.logger.log("info", "Warm-up em pagina neutra", ms=warmup)
+            try:
+                page.goto("https://www.google.com", wait_until="domcontentloaded")
+                page.wait_for_timeout(warmup)
+            except Exception as exc:
+                self.logger.log("warn", "Warm-up neutro falhou", erro=str(exc))
+            page.goto(self.config.url, wait_until="domcontentloaded")
         page.wait_for_timeout(self.config.wait_ms)
         self.debug.capture(page, "01_login_page", self.runtime)
 
@@ -749,6 +1422,10 @@ class BaseVivoApp:
             self.logger.log("warn", "Login falhou")
             return page
         self.debug.capture(page, "02_apos_login", self.runtime)
+
+        if getattr(self.config, "spike_login", False):
+            self.logger.log("ok", "Spike de login concluido (parando apos o login)")
+            return page
 
         self._pos_login(page)
 
@@ -1004,7 +1681,16 @@ def imprimir_tabela_listagem(
     print(fmt.format("Conta", "Referência", "Vencimento", "Situação", "Valor", "Arquivo"))
     print(sep)
     for r in linhas:
-        print(fmt.format(r["conta"], r["ref"], r["vencimento"], r["situacao"], r["valor"], r["arquivo"]))
+        print(
+            fmt.format(
+                r["conta"],
+                r["ref"],
+                r["vencimento"],
+                r["situacao"],
+                r["valor"],
+                r["arquivo"],
+            )
+        )
         if r["codigo_barras"] != "-":
             print(f"|  Cód.Barras: {r['codigo_barras']}")
         if r["pix"] != "-":

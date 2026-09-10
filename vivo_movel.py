@@ -12,9 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from vivo_core import (
-    DEFAULT_DASHBOARD_URL,
-    DEFAULT_INVOICES_URL,
-    DEFAULT_URL,
     BaseConfig,
     BaseVivoApp,
     BrowserActions,
@@ -28,10 +25,12 @@ from vivo_core import (
     coleta_data_hora_gmt_menos3,
     normalize_document,
     referencia_para_yyyymm,
+    resolve_engine,
     resolve_mode,
+    resolve_spike_login,
+    resolve_warmup_ms,
     validar_credenciais,
 )
-
 
 # ---------------------------------------------------------------------------
 # Config
@@ -208,14 +207,12 @@ class MovelDownloadService:
             situacao = ""
             try:
                 situacao = row.evaluate("""el => {
-                    let node = el.parentElement;
-                    while (node) {
-                        const badge = node.querySelector('.data-card-badge');
-                        if (badge) {
-                            return badge.getAttribute('aria-label') || badge.innerText.trim();
+                    let sibling = el.previousElementSibling;
+                    while (sibling) {
+                        if (sibling.classList && sibling.classList.contains('data-card-badge')) {
+                            return sibling.getAttribute('aria-label') || sibling.innerText.trim();
                         }
-                        if (node.hasAttribute('data-slider-root')) break;
-                        node = node.parentElement;
+                        sibling = sibling.previousElementSibling;
                     }
                     return '';
                 }""") or ""
@@ -521,6 +518,9 @@ def build_config(args: argparse.Namespace) -> MovelConfig:
         coleta_dt=coleta_data_hora_gmt_menos3(),
         limite=None if getattr(args, "todas", False) else args.limite,
         force=getattr(args, "force", False),
+        engine=resolve_engine(args),
+        spike_login=resolve_spike_login(args),
+        warmup_ms=resolve_warmup_ms(args),
     )
 
 
