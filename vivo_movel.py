@@ -15,6 +15,7 @@ from vivo_core import (
     BaseConfig,
     BaseVivoApp,
     BrowserActions,
+    DebugCollector,
     DownloadPanelService,
     Logger,
     add_common_args,
@@ -127,9 +128,10 @@ def _extrair_secoes_movel(page: Any, config: MovelConfig, logger: Logger) -> lis
 # ---------------------------------------------------------------------------
 
 class MovelDownloadService:
-    def __init__(self, logger: Logger) -> None:
+    def __init__(self, logger: Logger, debug: DebugCollector | None = None) -> None:
         self.logger = logger
         self.panel = DownloadPanelService(logger)
+        self.debug = debug
 
     def _clicar_exibir_detalhes(self, page: Any, sec_locator: Any) -> bool:
         for seletor in [
@@ -204,20 +206,22 @@ class MovelDownloadService:
                         vencimento = el.inner_text(timeout=1000).strip()
             except Exception:
                 pass
+            # O portal so exibe badge de status para a fatura mais recente
+            # (filho direto do .data-card que contem as linhas). As linhas
+            # de historico nao tem status: ficam vazias em vez de herdar o badge.
             situacao = ""
-            try:
-                situacao = row.evaluate("""el => {
-                    let sibling = el.previousElementSibling;
-                    while (sibling) {
-                        if (sibling.classList && sibling.classList.contains('data-card-badge')) {
-                            return sibling.getAttribute('aria-label') || sibling.innerText.trim();
+            if not opcoes:
+                try:
+                    situacao = row.evaluate("""el => {
+                        const card = el.parentElement;
+                        const badge = card && card.querySelector(':scope > .data-card-badge');
+                        if (badge) {
+                            return badge.getAttribute('aria-label') || badge.innerText.trim();
                         }
-                        sibling = sibling.previousElementSibling;
-                    }
-                    return '';
-                }""") or ""
-            except Exception:
-                pass
+                        return '';
+                    }""") or ""
+                except Exception:
+                    pass
             opcoes.append({"toggle": toggle, "vencimento": vencimento, "row": row, "situacao": situacao})
 
         self.logger.log("info", "Opcoes encontradas", total=len(opcoes))
@@ -402,6 +406,8 @@ class MovelDownloadService:
                 continue
 
             page.wait_for_timeout(config.wait_ms // 2)
+            if self.debug:
+                self.debug.capture(page, f"slide_{codigo_cliente}", runtime)
             opcoes = self._obter_opcoes_no_slide(page)
 
             if config.listar:
@@ -459,7 +465,7 @@ class VivoMovelApp(BaseVivoApp):
 
     def __init__(self, config: MovelConfig) -> None:
         super().__init__(config)
-        self.download_service = MovelDownloadService(self.logger)
+        self.download_service = MovelDownloadService(self.logger, self.debug)
 
     def _coletar_secoes(self, page: Any) -> list[dict[str, Any]]:
         secoes = _extrair_secoes_movel(page, self.config, self.logger)

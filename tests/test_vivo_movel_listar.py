@@ -28,6 +28,7 @@ class _ServicoEspiao(MovelDownloadService):
         self._opcoes = opcoes
         self.downloads = 0
         self.slides_fechados = 0
+        self.debug = None
 
     def _clicar_exibir_detalhes(self, page: Any, sec_locator: Any) -> bool:
         return True

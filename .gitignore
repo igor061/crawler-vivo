@@ -25,3 +25,4 @@ faturas_dados*.json
 *.egg-info/
 build/
 dist/
+.worktrees/
