@@ -52,6 +52,23 @@ class FixoConfig(BaseConfig):
 # Coleta de metadados das seções Fixo
 # ---------------------------------------------------------------------------
 
+def _ref_yyyymm(referencia: str) -> str:
+    """Normaliza a referencia do portal Fixo para AAAAMM.
+
+    O portal mostra "Ago/2026" nas faturas pagas e o vencimento "21/09/2026" na
+    fatura aberta (vence no proprio mes). Retorna "" se nao reconhecer.
+    """
+    ref = (referencia or "").strip()
+    if re.fullmatch(r"\d{6}", ref):
+        return ref
+    yyyymm = referencia_para_yyyymm(ref) if ref else ""
+    if not yyyymm and ref:
+        ano, mes = ano_mes_por_vencimento(ref)
+        if ano != "0000":
+            yyyymm = f"{ano}{mes}"
+    return yyyymm
+
+
 def _extrair_secoes_fixo(page: Any, config: FixoConfig, logger: Logger) -> list[dict[str, Any]]:
     """Coleta metadados de todas as seções/linhas de faturas Vivo Fixo."""
     secoes: list[dict[str, Any]] = []
@@ -312,11 +329,7 @@ class FixoDownloadService:
         runtime: dict[str, Any],
     ) -> dict[str, Any]:
         # Verifica se PDF já existe
-        ref_yyyymm = referencia_para_yyyymm(referencia) if referencia else ""
-        if not ref_yyyymm and referencia:
-            ano, mes = ano_mes_por_vencimento(referencia)
-            if ano != "0000":
-                ref_yyyymm = f"{ano}{mes}"
+        ref_yyyymm = _ref_yyyymm(referencia)
         pdf_existente = buscar_pdf_existente(config.download_dir, "vivo-fixo", cnpj, codigo_cliente, ref_yyyymm) if ref_yyyymm else None
         if pdf_existente and not config.force:
             self.logger.log("info", "PDF ja existe, pulando download", arquivo=pdf_existente.name)
@@ -480,13 +493,17 @@ class FixoDownloadService:
 
             for idx, opcao in enumerate(opcoes_para_baixar, start=1):
                 fatura = faturas_sec[idx - 1] if idx - 1 < len(faturas_sec) else {}
-                referencia = opcao.get("referencia") or fatura.get("referencia", "")
+                referencia_portal = opcao.get("referencia") or fatura.get("referencia", "")
+                referencia = _ref_yyyymm(referencia_portal) or referencia_portal
                 situacao = fatura.get("situacao", "") or opcao.get("situacao", "")
                 runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
-                resultados.append(self._baixar_com_retry(
+                resultado = self._baixar_com_retry(
                     page, opcao["toggle"], codigo_cliente, cnpj, idx,
                     referencia, situacao, config, runtime,
-                ))
+                )
+                resultado["referencia"] = referencia
+                resultado["referencia_portal"] = referencia_portal
+                resultados.append(resultado)
                 page.wait_for_timeout(500)
 
         return resultados
@@ -539,7 +556,8 @@ class VivoFixoApp(BaseVivoApp):
                     "codigo_cliente": sec.get("codigo_cliente", ""),
                     "linha_titulo": sec.get("linha_titulo", ""),
                     "valor": fat.get("valor", ""),
-                    "referencia": fat.get("referencia", ""),
+                    "referencia": _ref_yyyymm(fat.get("referencia", "")) or fat.get("referencia", ""),
+                    "referencia_portal": fat.get("referencia", ""),
                     "situacao": fat.get("situacao", ""),
                     "coleta_data_hora": self.config.coleta_data_hora,
                 })
