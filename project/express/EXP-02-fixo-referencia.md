@@ -17,3 +17,12 @@
 - `buscar_pdf_existente` acha os PDFs ja baixados por 202609/202608.
 - `plane.py vivo-fixo --json <novo>` (dry-run): ref 09 casa IDRCADM-177.
 Aprovada pelo usuario.
+
+## Gauntlet — rodada 1
+| Critico | Tier | Veredito |
+|---|---|---|
+| Arquitetura & Seguranca | sonnet | ✅ — retry/tentativas sem regressao; sugestoes: dedupe do fallback, `_resultado_falha` usado na listagem |
+| Qualidade & Testes | sonnet | ✅ — `tests/test_vivo_fixo_referencia.py`, 11 mutacoes pegas; suite 41 OK |
+
+Limite: ramo de download real nao exercitado em teste (sem rede); coberto pela validacao no portal.
+Reproduzir: `python -m pytest -q`
