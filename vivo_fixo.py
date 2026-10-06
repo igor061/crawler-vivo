@@ -496,11 +496,15 @@ class FixoDownloadService:
                 referencia_portal = opcao.get("referencia") or fatura.get("referencia", "")
                 referencia = _ref_yyyymm(referencia_portal) or referencia_portal
                 situacao = fatura.get("situacao", "") or opcao.get("situacao", "")
-                runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
-                resultado = self._baixar_com_retry(
-                    page, opcao["toggle"], codigo_cliente, cnpj, idx,
-                    referencia, situacao, config, runtime,
-                )
+                if config.listar:
+                    # --listar nunca baixa: so coleta os metadados do slide.
+                    resultado = self._resultado_falha(codigo_cliente, referencia, situacao, config, "")
+                else:
+                    runtime["tentativas"] = int(runtime.get("tentativas", 0)) + 1
+                    resultado = self._baixar_com_retry(
+                        page, opcao["toggle"], codigo_cliente, cnpj, idx,
+                        referencia, situacao, config, runtime,
+                    )
                 resultado["referencia"] = referencia
                 resultado["referencia_portal"] = referencia_portal
                 resultados.append(resultado)
